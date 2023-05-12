@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"regexp"
+	"encoding/json"
 
 	"github.com/jonboulle/clockwork"
 	"github.com/sirupsen/logrus"
@@ -277,6 +279,61 @@ func (p *sessionPlayer) playRange(from, to int) {
 			p.Unlock()
 		}
 	}()
+}
+
+type extendedRecord struct {
+	Event string `json:"event"`
+	Session []string `json:"session"`
+	SessionCleaned []string `json:"session_clean"`
+}
+
+func (p *sessionPlayer) playRangeExtended(from, to int) {
+	if to == 0 {
+		to = len(p.sessionEvents)
+	}
+	var i int
+	var builder strings.Builder
+	offset, bytes := 0, 0
+	for i = 0; i < to; i++ {
+		
+		e := p.sessionEvents[i]
+		eventType := e.GetString(events.EventType)
+
+		switch eventType {
+		// 'print' event (output)
+		case events.SessionPrintEvent:
+			offset = e.GetInt("offset")
+			bytes = e.GetInt("bytes")
+			data := p.stream[offset : offset+bytes]
+			builder.WriteString(string(data))
+
+		default:
+			jsonData, err := json.Marshal(e)
+			if err != nil {
+				fmt.Println("Error encoding JSON:", err)
+			}
+			fmt.Println(string(jsonData))
+			continue
+		}
+	}
+
+	session := builder.String()
+	ansiRegex := regexp.MustCompile("\x1b\\[(?:[0-9]{1,2}(?:;[0-9]{1,2})*)?[m|K]")
+	sessionCleaned := ansiRegex.ReplaceAllString(session, "")
+
+	sessionList := strings.Split(session, "\r\n")
+	sessionListCleaned := strings.Split(sessionCleaned, "\r\n")
+	extRec := extendedRecord{
+		Event: "print",
+		Session: sessionList,
+		SessionCleaned: sessionListCleaned,
+	}
+
+	jsonData, err := json.Marshal(extRec)
+	if err != nil {
+		fmt.Println("Error encoding JSON:", err)
+	}
+	fmt.Println(string(jsonData))
 }
 
 // applyDelay waits until it is time to play back the current event.

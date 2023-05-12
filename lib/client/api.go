@@ -2043,6 +2043,33 @@ func PlayFile(ctx context.Context, tarFile io.Reader, sid string) error {
 	return playSession(sessionEvents, stream)
 }
 
+
+// PlayFile plays the recorded session from a tar file
+func PlayFileExtended(ctx context.Context, tarFile io.Reader, sid string) error {
+	var sessionEvents []events.EventFields
+	var stream []byte
+	protoReader := events.NewProtoReader(tarFile)
+	playbackDir, err := os.MkdirTemp("", "playback")
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer os.RemoveAll(playbackDir)
+	w, err := events.WriteForSSHPlayback(ctx, session.ID(sid), protoReader, playbackDir)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	sessionEvents, err = w.SessionEvents()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	stream, err = w.SessionChunks()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return playSessionExtended(sessionEvents, stream)
+}
+
 // SFTP securely copies files between Nodes or SSH servers using SFTP
 func (tc *TeleportClient) SFTP(ctx context.Context, args []string, port int, opts sftp.Options, quiet bool) (err error) {
 	ctx, span := tc.Tracer.Start(
@@ -4646,6 +4673,12 @@ func playSession(sessionEvents []events.EventFields, stream []byte) error {
 	case err := <-errorCh:
 		return trace.Wrap(err)
 	}
+}
+
+func playSessionExtended(sessionEvents []events.EventFields, stream []byte) error {
+	player := newSessionPlayer(sessionEvents, stream, nil)
+	player.playRangeExtended(0,0)
+	return nil
 }
 
 func findActiveDatabases(key *Key) ([]tlsca.RouteToDatabase, error) {
