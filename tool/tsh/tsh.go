@@ -827,7 +827,7 @@ func Run(ctx context.Context, args []string, opts ...cliOption) error {
 	play.Flag("cluster", clusterHelp).Short('c').StringVar(&cf.SiteName)
 	play.Flag("format", defaults.FormatFlagDescription(
 		teleport.PTY, teleport.JSON, teleport.YAML,
-	)).Short('f').Default(teleport.PTY).EnumVar(&cf.Format, teleport.PTY, teleport.JSON, teleport.YAML)
+	)).Short('f').Default(teleport.PTY).EnumVar(&cf.Format, teleport.PTY, teleport.JSON, teleport.YAML, "json_extended")
 	play.Arg("session-id", "ID of the session to play").Required().StringVar(&cf.SessionID)
 
 	// scp
@@ -1515,8 +1515,11 @@ func serializeVersion(format string, proxyVersion string, proxyPublicAddress str
 //
 //	recording by connecting to the Teleport cluster
 func onPlay(cf *CLIConf) error {
-	if format := strings.ToLower(cf.Format); format == teleport.PTY {
+	format := strings.ToLower(cf.Format)
+	if format == teleport.PTY {
 		return playSession(cf)
+	} else if format == "json_extended" {
+		return playSessionExtended(cf)
 	}
 	return exportSession(cf)
 }
@@ -1568,6 +1571,34 @@ func playSession(cf *CLIConf) error {
 		}
 		defer tarFile.Close()
 		if err := client.PlayFile(cf.Context, tarFile, sid); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}
+	tc, err := makeClient(cf, true)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err := tc.Play(cf.Context, cf.Namespace, cf.SessionID); err != nil {
+		if trace.IsNotFound(err) {
+			log.WithError(err).Debug("error playing session")
+			return trace.NotFound("Recording for session %s not found.", cf.SessionID)
+		}
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func playSessionExtended(cf *CLIConf) error {
+	isLocalFile := path.Ext(cf.SessionID) == ".tar"
+	if isLocalFile {
+		sid := sessionIDFromPath(cf.SessionID)
+		tarFile, err := os.Open(cf.SessionID)
+		if err != nil {
+			return trace.ConvertSystemError(err)
+		}
+		defer tarFile.Close()
+		if err := client.PlayFileExtended(cf.Context, tarFile, sid); err != nil {
 			return trace.Wrap(err)
 		}
 		return nil
