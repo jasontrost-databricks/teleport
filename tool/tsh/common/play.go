@@ -54,7 +54,11 @@ func onPlay(cf *CLIConf) error {
 	format := strings.ToLower(cf.Format)
 	if format == teleport.PTY {
 		return playSession(cf)
-	} else if format == "json_extended" {
+	}
+	if cf.PlaySpeed != "1x" {
+		log.Warn("--speed is not applicable for formats other than pty")
+	}
+	if format == "json_extended" {
 		return playSessionExtended(cf)
 	}
 	return exportSession(cf)

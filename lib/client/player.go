@@ -21,7 +21,6 @@ package client
 import (
 	"context"
 	"os"
-	"regexp"
 	"encoding/json"
 
 	"github.com/gravitational/trace"
