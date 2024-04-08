@@ -72,7 +72,6 @@ func (p *playFromFileStreamer) StreamSessionEvents(
 type extendedRecord struct {
 	Event string `json:"event"`
 	Session []string `json:"session"`
-	SessionCleaned []string `json:"session_clean"`
 }
 
 func (p *sessionPlayer) playRangeExtended(from, to int) {
@@ -106,15 +105,10 @@ func (p *sessionPlayer) playRangeExtended(from, to int) {
 	}
 
 	session := builder.String()
-	ansiRegex := regexp.MustCompile("\x1b\\[(?:[0-9]{1,2}(?:;[0-9]{1,2})*)?[m|K]")
-	sessionCleaned := ansiRegex.ReplaceAllString(session, "")
-
 	sessionList := strings.Split(session, "\r\n")
-	sessionListCleaned := strings.Split(sessionCleaned, "\r\n")
 	extRec := extendedRecord{
 		Event: "print",
 		Session: sessionList,
-		SessionCleaned: sessionListCleaned,
 	}
 
 	jsonData, err := json.Marshal(extRec)
@@ -122,27 +116,4 @@ func (p *sessionPlayer) playRangeExtended(from, to int) {
 		fmt.Println("Error encoding JSON:", err)
 	}
 	fmt.Println(string(jsonData))
-}
-
-// applyDelay waits until it is time to play back the current event.
-// It returns the duration from the start of the session up until the current event.
-func (p *sessionPlayer) applyDelay(previousTimestamp time.Duration, e events.EventFields) time.Duration {
-	eventTime := time.Duration(e.GetInt("ms") * int(time.Millisecond))
-	delay := eventTime - previousTimestamp
-
-	// make playback smoother:
-	switch {
-	case delay < 10*time.Millisecond:
-		delay = 0
-	case delay > 250*time.Millisecond && delay < 500*time.Millisecond:
-		delay = 250 * time.Millisecond
-	case delay > 500*time.Millisecond && delay < 1*time.Second:
-		delay = 500 * time.Millisecond
-	case delay > time.Second:
-		delay = time.Second
-	}
-
-	timestampFrame(p.term, e.GetString("time"))
-	p.clock.Sleep(delay)
-	return eventTime
 }
