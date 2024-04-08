@@ -2211,6 +2211,12 @@ func playSession(ctx context.Context, sessionID string, speed float64, streamer 
 	return nil
 }
 
+func playSessionExtended(sessionEvents []events.EventFields, stream []byte) error {
+	player := newSessionPlayer(sessionEvents, stream, nil)
+	player.playRangeExtended(0,0)
+	return nil
+}
+
 func setTermSize(w io.Writer, size string) error {
 	width, height, ok := strings.Cut(size, ":")
 	if !ok {
@@ -5171,79 +5177,6 @@ func InsecureSkipHostKeyChecking(host string, remote net.Addr, key ssh.PublicKey
 // FedRAMP/FIPS 140-2 mode for tsh.
 func isFIPS() bool {
 	return modules.GetModules().IsBoringBinary()
-}
-
-// playSession plays session in the terminal
-func playSession(sessionEvents []events.EventFields, stream []byte) error {
-	term, err := terminal.New(nil, nil, nil)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	defer term.Close()
-
-	// configure terminal for direct unbuffered echo-less input:
-	if term.IsAttached() {
-		err := term.InitRaw(true)
-		if err != nil {
-			return trace.Wrap(err)
-		}
-	}
-
-	player := newSessionPlayer(sessionEvents, stream, term)
-	errorCh := make(chan error)
-	// keys:
-	const (
-		keyCtrlC = 3
-		keyCtrlD = 4
-		keySpace = 32
-		keyLeft  = 68
-		keyRight = 67
-		keyUp    = 65
-		keyDown  = 66
-	)
-	// playback control goroutine
-	go func() {
-		defer player.EndPlayback()
-		var key [1]byte
-		for {
-			_, err := term.Stdin().Read(key[:])
-			if err != nil {
-				errorCh <- err
-				return
-			}
-			switch key[0] {
-			// Ctrl+C or Ctrl+D
-			case keyCtrlC, keyCtrlD:
-				return
-			// Space key
-			case keySpace:
-				player.TogglePause()
-			// <- arrow
-			case keyLeft, keyDown:
-				player.Rewind()
-			// -> arrow
-			case keyRight, keyUp:
-				player.Forward()
-			}
-		}
-	}()
-	// player starts playing in its own goroutine
-	player.Play()
-	// wait for keypresses loop to end
-	select {
-	case <-player.stopC:
-		fmt.Println("\n\nend of session playback")
-		return nil
-	case err := <-errorCh:
-		return trace.Wrap(err)
-	}
-}
-
-func playSessionExtended(sessionEvents []events.EventFields, stream []byte) error {
-	player := newSessionPlayer(sessionEvents, stream, nil)
-	player.playRangeExtended(0,0)
-	return nil
 }
 
 func findActiveDatabases(key *Key) ([]tlsca.RouteToDatabase, error) {
