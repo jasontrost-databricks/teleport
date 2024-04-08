@@ -1,17 +1,19 @@
 /**
- * Copyright 2022 Gravitational, Inc.
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 import React, { useContext, useState, useEffect, useCallback } from 'react';
@@ -23,22 +25,33 @@ import {
   DiscoverEvent,
   DiscoverEventResource,
   userEventService,
+  DiscoverServiceDeployMethod,
+  DiscoverServiceDeploy,
+  DiscoverServiceDeployType,
 } from 'teleport/services/userEvent';
 import cfg from 'teleport/config';
-
+import { DiscoveryConfig } from 'teleport/services/discovery';
 import {
   addIndexToViews,
   findViewAtIndex,
-  ResourceViewConfig,
-  View,
-} from './flow';
+} from 'teleport/components/Wizard/flow';
+
+import { ResourceViewConfig, View } from './flow';
 import { viewConfigs } from './resourceViewConfigs';
+import { EViewConfigs } from './types';
+import { ServiceDeployMethod } from './Database/common';
 
 import type { Node } from 'teleport/services/nodes';
 import type { Kube } from 'teleport/services/kube';
 import type { Database } from 'teleport/services/databases';
-import type { AgentLabel } from 'teleport/services/agents';
+import type { ResourceLabel } from 'teleport/services/agents';
 import type { ResourceSpec } from './SelectResource';
+import type {
+  AwsRdsDatabase,
+  Ec2InstanceConnectEndpoint,
+  Integration,
+  Regions,
+} from 'teleport/services/integrations';
 
 export interface DiscoverContextState<T = any> {
   agentMeta: AgentMeta;
@@ -46,6 +59,7 @@ export interface DiscoverContextState<T = any> {
   nextStep: (count?: number) => void;
   prevStep: () => void;
   onSelectResource: (resource: ResourceSpec) => void;
+  exitFlow: () => void;
   resourceSpec: ResourceSpec;
   viewConfig: ResourceViewConfig<T>;
   indexedViews: View[];
@@ -63,15 +77,19 @@ type EventState = {
 };
 
 type CustomEventInput = {
+  id?: string;
   eventName?: DiscoverEvent;
   eventResourceName?: DiscoverEventResource;
   autoDiscoverResourcesCount?: number;
   selectedResourcesCount?: number;
+  serviceDeploy?: DiscoverServiceDeploy;
 };
 
 type DiscoverProviderProps = {
   // mockCtx used for testing purposes.
   mockCtx?: DiscoverContextState;
+  // Extra view configs that are passed in. This is used to add view configs from Enterprise.
+  eViewConfigs?: EViewConfigs;
 };
 
 // DiscoverUrlLocationState define fields to preserve state between
@@ -86,16 +104,17 @@ export type DiscoverUrlLocationState = {
     resourceSpec: ResourceSpec;
     currentStep: number;
   };
-  // integrationName is the name of the created integration
-  // resource name (eg: integration subkind "aws-oidc")
-  integrationName: string;
+  // integration is the created aws-oidc integration
+  integration: Integration;
 };
 
 const discoverContext = React.createContext<DiscoverContextState>(null);
 
-export function DiscoverProvider(
-  props: React.PropsWithChildren<DiscoverProviderProps>
-) {
+export function DiscoverProvider({
+  mockCtx,
+  children,
+  eViewConfigs = [],
+}: React.PropsWithChildren<DiscoverProviderProps>) {
   const history = useHistory();
   const location = useLocation<DiscoverUrlLocationState>();
 
@@ -113,13 +132,28 @@ export function DiscoverProvider(
     (status: DiscoverEventStepStatus, custom?: CustomEventInput) => {
       const { id, currEventName } = eventState;
 
+      const event = custom?.eventName || currEventName;
+
+      let serviceDeploy: DiscoverServiceDeploy;
+      if (event === DiscoverEvent.DeployService) {
+        if (custom?.serviceDeploy) {
+          serviceDeploy = custom.serviceDeploy;
+        } else {
+          serviceDeploy = {
+            method: DiscoverServiceDeployMethod.Unspecified,
+            type: DiscoverServiceDeployType.Unspecified,
+          };
+        }
+      }
+
       userEventService.captureDiscoverEvent({
-        event: custom?.eventName || currEventName,
+        event,
         eventData: {
-          id,
+          id: id || custom.id,
           resource: custom?.eventResourceName || resourceSpec?.event,
           autoDiscoverResourcesCount: custom?.autoDiscoverResourcesCount,
           selectedResourcesCount: custom?.selectedResourcesCount,
+          serviceDeploy,
           ...status,
         },
       });
@@ -198,9 +232,9 @@ export function DiscoverProvider(
   // The location.state.discover should contain all the state that allows
   // the user to resume from where they left of.
   function resumeDiscoverFlow() {
-    const { discover, integrationName } = location.state;
+    const { discover, integration } = location.state;
 
-    updateAgentMeta({ integrationName } as DbMeta);
+    updateAgentMeta({ awsIntegration: integration });
 
     startDiscoverFlow(
       discover.resourceSpec,
@@ -213,6 +247,7 @@ export function DiscoverProvider(
       {
         eventName: discover.eventState.currEventName,
         eventResourceName: discover.resourceSpec.event,
+        id: discover.eventState.id,
       }
     );
   }
@@ -223,7 +258,7 @@ export function DiscoverProvider(
     // We still want to emit an event if user clicked on an
     // unguided link to gather data on which unguided resource
     // is most popular.
-    if (resource.unguidedLink) {
+    if (resource.unguidedLink || resource.isDialog) {
       emitEvent(
         { stepStatus: DiscoverEventStatus.Success },
         {
@@ -256,8 +291,10 @@ export function DiscoverProvider(
     targetViewIndex = 0
   ) {
     // Process each view and assign each with an index number.
-    const currCfg = viewConfigs.find(r => r.kind === resource.kind);
-    let indexedViews = [];
+    const currCfg = [...viewConfigs, ...eViewConfigs].find(
+      r => r.kind === resource.kind
+    );
+    let indexedViews: View[] = [];
     if (typeof currCfg.views === 'function') {
       indexedViews = addIndexToViews(currCfg.views(resource));
     } else {
@@ -349,10 +386,7 @@ export function DiscoverProvider(
     if (currentStep === 0) {
       // Emit abort since we are starting over with resource selection.
       emitEvent({ stepStatus: DiscoverEventStatus.Aborted });
-      initEventState();
-      setViewConfig(null);
-      setResourceSpec(null);
-      setIndexedViews([]);
+      exitFlow();
       return;
     }
 
@@ -361,6 +395,13 @@ export function DiscoverProvider(
     if (nextView) {
       setCurrentStep(updatedCurrentStep);
     }
+  }
+
+  function exitFlow() {
+    initEventState();
+    setViewConfig(null);
+    setResourceSpec(null);
+    setIndexedViews([]);
   }
 
   function updateAgentMeta(meta: AgentMeta) {
@@ -373,7 +414,14 @@ export function DiscoverProvider(
         stepStatus: DiscoverEventStatus.Error,
         stepStatusError: errorStr,
       },
-      { autoDiscoverResourcesCount: 0, selectedResourcesCount: 0 }
+      {
+        autoDiscoverResourcesCount: 0,
+        selectedResourcesCount: 0,
+        serviceDeploy: {
+          method: DiscoverServiceDeployMethod.Unspecified,
+          type: DiscoverServiceDeployType.Unspecified,
+        },
+      }
     );
   }
 
@@ -383,6 +431,7 @@ export function DiscoverProvider(
     nextStep,
     prevStep,
     onSelectResource,
+    exitFlow,
     resourceSpec,
     viewConfig,
     setResourceSpec,
@@ -394,8 +443,8 @@ export function DiscoverProvider(
   };
 
   return (
-    <discoverContext.Provider value={props.mockCtx || value}>
-      {props.children}
+    <discoverContext.Provider value={mockCtx || value}>
+      {children}
     </discoverContext.Provider>
   );
 }
@@ -405,21 +454,52 @@ export function useDiscover<T = any>(): DiscoverContextState<T> {
 }
 
 type BaseMeta = {
-  // resourceName provides a consistent field to refer to for
-  // the resource name since resources can refer to its name
-  // by different field names.
-  // Eg. used in Finish (last step) component.
-  resourceName: string;
-  // agentMatcherLabels are labels that will be used by the agent
-  // to pick up the newly created database (looks for matching labels).
-  // At least one must match.
-  agentMatcherLabels: AgentLabel[];
+  /**
+   * resourceName provides a consistent field to refer to since
+   * different resources can refer to its name by different field names.
+   * Eg. used in Finish (last step) component.
+   * This field is set when user has finished enrolling a resource.
+   */
+  resourceName?: string;
+  /**
+   * agentMatcherLabels are labels (defined in the enrolled resource)
+   * that are suggested to the user to be used as label matcher for
+   * an agent.
+   *
+   * This field is set when user has finished enrolling a resource.
+   */
+  agentMatcherLabels?: ResourceLabel[];
+
+  /**
+   * awsIntegration is set to the selected AWS integration.
+   * This field is set when a user wants to enroll AWS resources.
+   */
+  awsIntegration?: Integration;
+  /**
+   * awsRegion is set to the selected AWS region.
+   * This field is set when a user wants to enroll AWS resources.
+   */
+  awsRegion?: Regions;
+  /**
+   * If this field is defined, then user opted for auto discovery.
+   * Auto discover will automatically identify and register resources
+   * in customers infrastructure such as Kubernetes clusters or databases hosted
+   * on cloud platforms like AWS, Azure, etc.
+   */
+  autoDiscovery?: {
+    config: DiscoveryConfig;
+    // requiredVpcsAndSubnets is a map of required vpcs for auto discovery.
+    // If this is empty, then a user can skip deploying db agents.
+    // If >0, auto discovery requires deploying db agents.
+    requiredVpcsAndSubnets?: Record<string, string[]>;
+  };
 };
 
 // NodeMeta describes the fields for node resource
 // that needs to be preserved throughout the flow.
 export type NodeMeta = BaseMeta & {
   node: Node;
+  ec2Ice?: Ec2InstanceConnectEndpoint;
 };
 
 // DbMeta describes the fields for a db resource
@@ -427,8 +507,13 @@ export type NodeMeta = BaseMeta & {
 export type DbMeta = BaseMeta & {
   // TODO(lisa): when we can enroll multiple RDS's, turn this into an array?
   // The enroll event expects num count of enrolled RDS's, update accordingly.
-  db: Database;
-  integrationName?: string;
+  db?: Database;
+  selectedAwsRdsDb?: AwsRdsDatabase;
+  /**
+   * serviceDeployedMethod flag will be undefined if user skipped
+   * deploying service (service already existed).
+   */
+  serviceDeployedMethod?: ServiceDeployMethod;
 };
 
 // KubeMeta describes the fields for a kube resource
@@ -437,6 +522,27 @@ export type KubeMeta = BaseMeta & {
   kube: Kube;
 };
 
-export type AgentMeta = DbMeta | NodeMeta | KubeMeta;
+// KubeMeta describes the fields for a kube resource
+// that needs to be preserved throughout the flow.
+export type EksMeta = BaseMeta & {
+  kube: Kube;
+};
+
+// SamlMeta describes the fields for SAML IdP
+// service provider resource that needs to be
+// preserved throughout the flow.
+export type SamlMeta = BaseMeta & SamlGcpWorkforceMeta;
+
+// GcpWorkforceMeta describes the fields for SAML
+// GCP workforce pool resource that needs to be
+// preserved throughout the flow.
+export type SamlGcpWorkforceMeta = {
+  isAutoConfig: boolean;
+  orgId: string;
+  poolName: string;
+  poolProviderName: string;
+};
+
+export type AgentMeta = DbMeta | NodeMeta | KubeMeta | EksMeta | SamlMeta;
 
 export type State = ReturnType<typeof useDiscover>;

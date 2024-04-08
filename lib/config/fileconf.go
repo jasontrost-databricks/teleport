@@ -1,18 +1,20 @@
 /*
-Copyright 2015-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package config
 
@@ -27,25 +29,24 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/coreos/go-oidc/oauth2"
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 	"gopkg.in/yaml.v2"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/types/installers"
 	apiutils "github.com/gravitational/teleport/api/utils"
+	"github.com/gravitational/teleport/api/utils/keys"
 	"github.com/gravitational/teleport/api/utils/tlsutils"
+	"github.com/gravitational/teleport/lib/automaticupgrades"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/client"
 	"github.com/gravitational/teleport/lib/defaults"
@@ -53,7 +54,6 @@ import (
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/sshutils/x11"
 	"github.com/gravitational/teleport/lib/utils"
-	awsutils "github.com/gravitational/teleport/lib/utils/aws"
 )
 
 // FileConfig structure represents the teleport configuration stored in a config file
@@ -94,14 +94,20 @@ type FileConfig struct {
 	// Okta is the "okta_service" section in the Teleport configuration file
 	Okta Okta `yaml:"okta_service,omitempty"`
 
+	// Jamf is the "jamf_service" section in the config file.
+	Jamf JamfService `yaml:"jamf_service,omitempty"`
+
 	// Plugins is the section of the config for configuring the plugin service.
 	Plugins PluginService `yaml:"plugin_service,omitempty"`
+
+	// AccessGraph is the section of the config describing AccessGraph service
+	AccessGraph AccessGraph `yaml:"access_graph,omitempty"`
 }
 
 // ReadFromFile reads Teleport configuration from a file. Currently only YAML
 // format is supported
 func ReadFromFile(filePath string) (*FileConfig, error) {
-	f, err := os.Open(filePath)
+	f, err := utils.OpenFileAllowingUnsafeLinks(filePath)
 	if err != nil {
 		if errors.Is(err, fs.ErrPermission) {
 			return nil, trace.Wrap(err, "failed to open file for Teleport configuration: %v. Ensure that you are running as a user with appropriate permissions.", filePath)
@@ -182,6 +188,11 @@ type SampleFlags struct {
 	JoinMethod string
 	// NodeName is the name of the teleport node
 	NodeName string
+	// Silent suppresses user hint printed after config has been generated.
+	Silent bool
+	// AzureClientID is the client ID of the managed identity to use when joining
+	// the cluster. Only applicable for the azure join method.
+	AzureClientID string
 }
 
 // MakeSampleFileConfig returns a sample config to start
@@ -218,13 +229,8 @@ func MakeSampleFileConfig(flags SampleFlags) (fc *FileConfig, err error) {
 		g.DataDir = defaults.DataDir
 	}
 
-	joinMethod := flags.JoinMethod
-	if joinMethod == "" && flags.AuthToken != "" {
-		joinMethod = string(types.JoinMethodToken)
-	}
-	g.JoinParams = JoinParams{
-		TokenName: flags.AuthToken,
-		Method:    types.JoinMethod(joinMethod),
+	if err := setJoinParams(&g, flags); err != nil {
+		return nil, trace.Wrap(err)
 	}
 
 	if flags.Version == defaults.TeleportConfigVersionV3 {
@@ -298,6 +304,23 @@ func MakeSampleFileConfig(flags SampleFlags) (fc *FileConfig, err error) {
 	return fc, nil
 }
 
+func setJoinParams(g *Global, flags SampleFlags) error {
+	joinMethod := flags.JoinMethod
+	if joinMethod == "" && flags.AuthToken != "" {
+		joinMethod = string(types.JoinMethodToken)
+	}
+	g.JoinParams = JoinParams{
+		TokenName: flags.AuthToken,
+		Method:    types.JoinMethod(joinMethod),
+	}
+	if flags.AzureClientID != "" {
+		g.JoinParams.Azure = AzureJoinParams{
+			ClientID: flags.AzureClientID,
+		}
+	}
+	return nil
+}
+
 func makeSampleSSHConfig(conf *servicecfg.Config, flags SampleFlags, enabled bool) (SSH, error) {
 	var s SSH
 	if enabled {
@@ -305,7 +328,7 @@ func makeSampleSSHConfig(conf *servicecfg.Config, flags SampleFlags, enabled boo
 		s.ListenAddress = conf.SSH.Addr.Addr
 		s.Commands = []CommandLabel{
 			{
-				Name:    "hostname",
+				Name:    defaults.HostnameLabel,
 				Command: []string{"hostname"},
 				Period:  time.Minute,
 			},
@@ -466,241 +489,6 @@ func (conf *FileConfig) CheckAndSetDefaults() error {
 		}
 	}
 
-	if err := checkAndSetDefaultsForAWSMatchers(conf.Discovery.AWSMatchers); err != nil {
-		return trace.Wrap(err)
-	}
-	if err := checkAndSetDefaultsForAzureMatchers(conf.Discovery.AzureMatchers); err != nil {
-		return trace.Wrap(err)
-	}
-	if err := checkAndSetDefaultsForGCPMatchers(conf.Discovery.GCPMatchers); err != nil {
-		return trace.Wrap(err)
-	}
-
-	return nil
-}
-
-// awsRegions returns the list of all regions available on every aws partition.
-// It is used to validate the AWSMatcher.Regions values.
-func awsRegions() []string {
-	var regions []string
-	partitions := endpoints.DefaultPartitions()
-	for _, partition := range partitions {
-		regions = append(regions, maps.Keys(partition.Regions())...)
-	}
-	return regions
-}
-
-// checkAndSetDefaultsForAWSMatchers sets the default values for discovery AWS matchers
-// and validates the provided types.
-func checkAndSetDefaultsForAWSMatchers(matcherInput []AWSMatcher) error {
-	regions := awsRegions()
-	for i := range matcherInput {
-		matcher := &matcherInput[i]
-		for _, matcherType := range matcher.Types {
-			if !slices.Contains(services.SupportedAWSMatchers, matcherType) {
-				return trace.BadParameter("discovery service type does not support %q, supported resource types are: %v",
-					matcherType, services.SupportedAWSMatchers)
-			}
-		}
-
-		if len(matcher.Regions) == 0 {
-			return trace.BadParameter("discovery service requires at least one region; supported regions are: %v",
-				regions)
-		}
-
-		for _, region := range matcher.Regions {
-			if !slices.Contains(regions, region) {
-				return trace.BadParameter("discovery service does not support region %q; supported regions are: %v",
-					region, regions)
-			}
-		}
-
-		if matcher.AssumeRoleARN != "" {
-			_, err := awsutils.ParseRoleARN(matcher.AssumeRoleARN)
-			if err != nil {
-				return trace.Wrap(err, "discovery service AWS matcher assume_role_arn is invalid")
-			}
-		} else if matcher.ExternalID != "" {
-			for _, t := range matcher.Types {
-				if !slices.Contains(services.RequireAWSIAMRolesAsUsersMatchers, t) {
-					return trace.BadParameter("discovery service AWS matcher assume_role_arn is empty, but has external_id %q",
-						matcher.ExternalID)
-				}
-			}
-		}
-
-		if matcher.Tags == nil || len(matcher.Tags) == 0 {
-			matcher.Tags = map[string]apiutils.Strings{types.Wildcard: {types.Wildcard}}
-		}
-
-		var installParams services.InstallerParams
-		var err error
-
-		if matcher.InstallParams == nil {
-			matcher.InstallParams = &InstallParams{
-				JoinParams: JoinParams{
-					TokenName: defaults.IAMInviteTokenName,
-					Method:    types.JoinMethodIAM,
-				},
-				ScriptName:      installers.InstallerScriptName,
-				InstallTeleport: "",
-				SSHDConfig:      defaults.SSHDConfigPath,
-			}
-			installParams, err = matcher.InstallParams.Parse()
-			if err != nil {
-				return trace.Wrap(err)
-			}
-		} else {
-			if method := matcher.InstallParams.JoinParams.Method; method == "" {
-				matcher.InstallParams.JoinParams.Method = types.JoinMethodIAM
-			} else if method != types.JoinMethodIAM {
-				return trace.BadParameter("only IAM joining is supported for EC2 auto-discovery")
-			}
-
-			if matcher.InstallParams.JoinParams.TokenName == "" {
-				matcher.InstallParams.JoinParams.TokenName = defaults.IAMInviteTokenName
-			}
-
-			if matcher.InstallParams.SSHDConfig == "" {
-				matcher.InstallParams.SSHDConfig = defaults.SSHDConfigPath
-			}
-
-			installParams, err = matcher.InstallParams.Parse()
-			if err != nil {
-				return trace.Wrap(err)
-			}
-
-			if installer := matcher.InstallParams.ScriptName; installer == "" {
-				if installParams.InstallTeleport {
-					matcher.InstallParams.ScriptName = installers.InstallerScriptName
-				} else {
-					matcher.InstallParams.ScriptName = installers.InstallerScriptNameAgentless
-				}
-			}
-		}
-
-		if matcher.SSM.DocumentName == "" {
-			if installParams.InstallTeleport {
-				matcher.SSM.DocumentName = defaults.AWSInstallerDocument
-			} else {
-				matcher.SSM.DocumentName = defaults.AWSAgentlessInstallerDocument
-			}
-		}
-	}
-	return nil
-}
-
-// checkAndSetDefaultsForAzureMatchers sets the default values for discovery Azure matchers
-// and validates the provided types.
-func checkAndSetDefaultsForAzureMatchers(matcherInput []AzureMatcher) error {
-	for i := range matcherInput {
-		matcher := &matcherInput[i]
-
-		if len(matcher.Types) == 0 {
-			return trace.BadParameter("At least one Azure discovery service type must be specified, the supported resource types are: %v",
-				services.SupportedAzureMatchers)
-		}
-
-		for _, matcherType := range matcher.Types {
-			if !slices.Contains(services.SupportedAzureMatchers, matcherType) {
-				return trace.BadParameter("Azure discovery service type does not support %q resource type; supported resource types are: %v",
-					matcherType, services.SupportedAzureMatchers)
-			}
-		}
-
-		if slices.Contains(matcher.Types, services.AzureMatcherVM) {
-			if err := checkAndSetDefaultsForAzureInstaller(matcher); err != nil {
-				return trace.Wrap(err)
-			}
-		}
-
-		if slices.Contains(matcher.Regions, types.Wildcard) || len(matcher.Regions) == 0 {
-			matcher.Regions = []string{types.Wildcard}
-		}
-
-		if slices.Contains(matcher.Subscriptions, types.Wildcard) || len(matcher.Subscriptions) == 0 {
-			matcher.Subscriptions = []string{types.Wildcard}
-		}
-
-		if slices.Contains(matcher.ResourceGroups, types.Wildcard) || len(matcher.ResourceGroups) == 0 {
-			matcher.ResourceGroups = []string{types.Wildcard}
-		}
-
-		if len(matcher.ResourceTags) == 0 {
-			matcher.ResourceTags = map[string]apiutils.Strings{
-				types.Wildcard: {types.Wildcard},
-			}
-		}
-
-	}
-	return nil
-}
-
-func checkAndSetDefaultsForAzureInstaller(matcher *AzureMatcher) error {
-	if matcher.InstallParams == nil {
-		matcher.InstallParams = &InstallParams{
-			JoinParams: JoinParams{
-				TokenName: defaults.AzureInviteTokenName,
-				Method:    types.JoinMethodAzure,
-			},
-			ScriptName: installers.InstallerScriptName,
-		}
-		return nil
-	}
-
-	switch matcher.InstallParams.JoinParams.Method {
-	case types.JoinMethodAzure, "":
-		matcher.InstallParams.JoinParams.Method = types.JoinMethodAzure
-	default:
-		return trace.BadParameter("only Azure joining is supported for Azure auto-discovery")
-	}
-
-	if token := matcher.InstallParams.JoinParams.TokenName; token == "" {
-		matcher.InstallParams.JoinParams.TokenName = defaults.AzureInviteTokenName
-	}
-
-	if installer := matcher.InstallParams.ScriptName; installer == "" {
-		matcher.InstallParams.ScriptName = installers.InstallerScriptName
-	}
-	return nil
-}
-
-// checkAndSetDefaultsForGCPMatchers sets the default values for GCP matchers
-// and validates the provided types.
-func checkAndSetDefaultsForGCPMatchers(matcherInput []GCPMatcher) error {
-	for i := range matcherInput {
-		matcher := &matcherInput[i]
-
-		if len(matcher.Types) == 0 {
-			return trace.BadParameter("At least one GCP discovery service type must be specified, the supported resource types are: %v",
-				services.SupportedGCPMatchers)
-		}
-
-		for _, matcherType := range matcher.Types {
-			if !slices.Contains(services.SupportedGCPMatchers, matcherType) {
-				return trace.BadParameter("GCP discovery service type does not support %q resource type; supported resource types are: %v",
-					matcherType, services.SupportedGCPMatchers)
-			}
-		}
-
-		if slices.Contains(matcher.Locations, types.Wildcard) || len(matcher.Locations) == 0 {
-			matcher.Locations = []string{types.Wildcard}
-		}
-
-		if slices.Contains(matcher.ProjectIDs, types.Wildcard) {
-			return trace.BadParameter("GCP discovery service project_ids does not support wildcards; please specify at least one value in project_ids.")
-		}
-		if len(matcher.ProjectIDs) == 0 {
-			return trace.BadParameter("GCP discovery service project_ids does cannot be empty; please specify at least one value in project_ids.")
-		}
-
-		if len(matcher.Tags) == 0 {
-			matcher.Tags = map[string]apiutils.Strings{
-				types.Wildcard: {types.Wildcard},
-			}
-		}
-
-	}
 	return nil
 }
 
@@ -769,7 +557,8 @@ func (l *Log) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type logYAML Log
 	log := (*logYAML)(l)
 	if err := unmarshal(log); err != nil {
-		if _, ok := err.(*yaml.TypeError); !ok {
+		var typeError *yaml.TypeError
+		if !errors.As(err, &typeError) {
 			return err
 		}
 
@@ -910,9 +699,14 @@ func (s *Service) Disabled() bool {
 type Auth struct {
 	Service `yaml:",inline"`
 
-	// ProxyProtocol enables support for HAProxy proxy protocol version 1 when it is turned 'on'.
-	// Verify whether the service is in front of a trusted load balancer.
-	// The default value is 'on'.
+	// ProxyProtocol controls support for HAProxy PROXY protocol.
+	// Possible values:
+	// - 'on': one PROXY header is accepted and required per incoming connection.
+	// - 'off': no PROXY headers are allows, otherwise connection is rejected.
+	// If unspecified - one PROXY header is allowed, but not required. Connection is marked with source port set to 0
+	// and IP pinning will not be allowed. It is supposed to be used only as default mode for test setups.
+	// In production you should always explicitly set the mode based on your network setup - if you have L4 load balancer
+	// with enabled PROXY protocol in front of Teleport you should set it to 'on', if you don't have it, set it to 'off'
 	ProxyProtocol string `yaml:"proxy_protocol,omitempty"`
 
 	// ClusterName is the name of the CA who manages this cluster
@@ -1003,6 +797,9 @@ type Auth struct {
 	// connections, regular TLS routing connections are not affected.
 	ProxyPingInterval types.Duration `yaml:"proxy_ping_interval,omitempty"`
 
+	// CaseInsensitiveRouting causes proxies to use case-insensitive hostname matching.
+	CaseInsensitiveRouting bool `yaml:"case_insensitive_routing,omitempty"`
+
 	// LoadAllCAs tells tsh to load the CAs for all clusters when trying
 	// to ssh into a node, instead of just the CA for the current cluster.
 	LoadAllCAs bool `yaml:"load_all_cas,omitempty"`
@@ -1010,6 +807,12 @@ type Auth struct {
 	// HostedPlugins configures the hosted plugins runtime.
 	// This is currently Cloud-specific.
 	HostedPlugins HostedPlugins `yaml:"hosted_plugins,omitempty"`
+
+	// Assist is a set of options related to the Teleport Assist feature.
+	Assist *AuthAssistOptions `yaml:"assist,omitempty"`
+
+	// AccessMonitoring is a set of options related to the Access Monitoring feature.
+	AccessMonitoring *servicecfg.AccessMonitoringOptions `yaml:"access_monitoring,omitempty"`
 }
 
 // PluginService represents the configuration for the plugin service.
@@ -1017,6 +820,18 @@ type PluginService struct {
 	Enabled bool `yaml:"enabled"`
 	// Plugins is a map of matchers for enabled plugin resources.
 	Plugins map[string]string `yaml:"plugins,omitempty"`
+}
+
+// AccessGraph represents the configuration for the AccessGraph service.
+type AccessGraph struct {
+	// Enabled enables the AccessGraph service.
+	Enabled bool `yaml:"enabled"`
+	// Endpoint is the endpoint of the AccessGraph service.
+	Endpoint string `yaml:"endpoint"`
+	// CA is the path to the CA certificate for the AccessGraph service.
+	CA string `yaml:"ca"`
+	// Insecure is true if the AccessGraph service should not verify the CA.
+	Insecure bool `yaml:"insecure"`
 }
 
 // Opsgenie represents the configuration for the Opsgenie plugin.
@@ -1038,7 +853,8 @@ func (a *Auth) hasCustomNetworkingConfig() bool {
 		a.ProxyListenerMode != empty.ProxyListenerMode ||
 		a.RoutingStrategy != empty.RoutingStrategy ||
 		a.TunnelStrategy != empty.TunnelStrategy ||
-		a.ProxyPingInterval != empty.ProxyPingInterval
+		a.ProxyPingInterval != empty.ProxyPingInterval ||
+		(a.Assist != nil && a.Assist.CommandExecutionWorkers != 0)
 }
 
 // hasCustomSessionRecording returns true if any of the session recording
@@ -1057,6 +873,9 @@ type CAKeyParams struct {
 	// GoogleCloudKMS configures Google Cloud Key Management Service to to be used for
 	// all CA private key crypto operations.
 	GoogleCloudKMS *GoogleCloudKMS `yaml:"gcp_kms,omitempty"`
+	// AWSKMS configures AWS Key Management Service to to be used for
+	// all CA private key crypto operations.
+	AWSKMS *AWSKMS `yaml:"aws_kms,omitempty"`
 }
 
 // PKCS11 configures a PKCS#11 HSM to be used for private key generation and
@@ -1091,6 +910,15 @@ type GoogleCloudKMS struct {
 	// For more information, see https://cloud.google.com/kms/docs/algorithms#protection_levels
 	// Supported options are "HSM" and "SOFTWARE".
 	ProtectionLevel string `yaml:"protection_level"`
+}
+
+// AWSKMS configures AWS Key Management Service to to be used for all CA private
+// key crypto operations.
+type AWSKMS struct {
+	// Account is the AWS account to use.
+	Account string `yaml:"account"`
+	// Region is the AWS region to use.
+	Region string `yaml:"region"`
 }
 
 // TrustedCluster struct holds configuration values under "trusted_clusters" key
@@ -1198,6 +1026,17 @@ type AuthenticationConfig struct {
 	// DeviceTrust holds settings related to trusted device verification.
 	// Requires Teleport Enterprise.
 	DeviceTrust *DeviceTrust `yaml:"device_trust,omitempty"`
+
+	// DefaultSessionTTL is the default cluster max session ttl
+	DefaultSessionTTL types.Duration `yaml:"default_session_ttl"`
+
+	// Deprecated. HardwareKey.PIVSlot should be used instead.
+	// TODO(Joerger): DELETE IN 17.0.0
+	PIVSlot keys.PIVSlot `yaml:"piv_slot,omitempty"`
+
+	// HardwareKey holds settings related to hardware key support.
+	// Requires Teleport Enterprise.
+	HardwareKey *HardwareKey `yaml:"hardware_key,omitempty"`
 }
 
 // Parse returns valid types.AuthPreference instance.
@@ -1228,6 +1067,22 @@ func (a *AuthenticationConfig) Parse() (types.AuthPreference, error) {
 		}
 	}
 
+	var h *types.HardwareKey
+	if a.HardwareKey != nil {
+		h, err = a.HardwareKey.Parse()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	// TODO(Joerger): DELETE IN 17.0.0
+	if a.PIVSlot != "" {
+		log.Warn(`The "piv_slot" setting will be removed in 17.0.0, please set "hardware_key.piv_slot" instead.`)
+		if err = a.PIVSlot.Validate(); err != nil {
+			return nil, trace.Wrap(err, "failed to parse piv_slot")
+		}
+	}
+
 	return types.NewAuthPreferenceFromConfigFile(types.AuthPreferenceSpecV2{
 		Type:              a.Type,
 		SecondFactor:      a.SecondFactor,
@@ -1240,6 +1095,9 @@ func (a *AuthenticationConfig) Parse() (types.AuthPreference, error) {
 		AllowPasswordless: a.Passwordless,
 		AllowHeadless:     a.Headless,
 		DeviceTrust:       dt,
+		DefaultSessionTTL: a.DefaultSessionTTL,
+		PIVSlot:           string(a.PIVSlot),
+		HardwareKey:       h,
 	})
 }
 
@@ -1252,7 +1110,7 @@ type UniversalSecondFactor struct {
 }
 
 func (u *UniversalSecondFactor) Parse() (*types.U2F, error) {
-	attestationCAs, err := getAttestationPEMs(u.DeviceAttestationCAs)
+	attestationCAs, err := getCertificatePEMs(u.DeviceAttestationCAs)
 	if err != nil {
 		return nil, trace.BadParameter("u2f.device_attestation_cas: %v", err)
 	}
@@ -1272,11 +1130,11 @@ type Webauthn struct {
 }
 
 func (w *Webauthn) Parse() (*types.Webauthn, error) {
-	allowedCAs, err := getAttestationPEMs(w.AttestationAllowedCAs)
+	allowedCAs, err := getCertificatePEMs(w.AttestationAllowedCAs)
 	if err != nil {
 		return nil, trace.BadParameter("webauthn.attestation_allowed_cas: %v", err)
 	}
-	deniedCAs, err := getAttestationPEMs(w.AttestationDeniedCAs)
+	deniedCAs, err := getCertificatePEMs(w.AttestationDeniedCAs)
 	if err != nil {
 		return nil, trace.BadParameter("webauthn.attestation_denied_cas: %v", err)
 	}
@@ -1295,10 +1153,10 @@ func (w *Webauthn) Parse() (*types.Webauthn, error) {
 	}, nil
 }
 
-func getAttestationPEMs(certOrPaths []string) ([]string, error) {
+func getCertificatePEMs(certOrPaths []string) ([]string, error) {
 	res := make([]string, len(certOrPaths))
 	for i, certOrPath := range certOrPaths {
-		pem, err := getAttestationPEM(certOrPath)
+		pem, err := getCertificatePEM(certOrPath)
 		if err != nil {
 			return nil, err
 		}
@@ -1307,7 +1165,7 @@ func getAttestationPEMs(certOrPaths []string) ([]string, error) {
 	return res, nil
 }
 
-func getAttestationPEM(certOrPath string) (string, error) {
+func getCertificatePEM(certOrPath string) (string, error) {
 	_, parseErr := tlsutils.ParseCertificatePEM([]byte(certOrPath))
 	if parseErr == nil {
 		return certOrPath, nil // OK, valid inline PEM
@@ -1317,11 +1175,11 @@ func getAttestationPEM(certOrPath string) (string, error) {
 	data, err := os.ReadFile(certOrPath)
 	if err != nil {
 		// Don't use trace in order to keep a clean error message.
-		return "", fmt.Errorf("%q is not a valid x509 certificate (%v) and can't be read as a file (%v)", certOrPath, parseErr, err)
+		return "", fmt.Errorf("%q is not a valid x509 certificate (%w) and can't be read as a file (%w)", certOrPath, parseErr, err)
 	}
 	if _, err := tlsutils.ParseCertificatePEM(data); err != nil {
 		// Don't use trace in order to keep a clean error message.
-		return "", fmt.Errorf("file %q contains an invalid x509 certificate: %v", certOrPath, err)
+		return "", fmt.Errorf("file %q contains an invalid x509 certificate: %w", certOrPath, err)
 	}
 
 	return string(data), nil // OK, valid PEM file
@@ -1335,6 +1193,16 @@ type DeviceTrust struct {
 	Mode string `yaml:"mode,omitempty"`
 	// AutoEnroll is the toggle for the device auto-enroll feature.
 	AutoEnroll string `yaml:"auto_enroll,omitempty"`
+	// EKCertAllowedCAs is an allow list of EKCert CAs. These may be specified
+	// as a PEM encoded certificate or as a path to a PEM encoded certificate.
+	//
+	// If present, only TPM devices that present an EKCert that is signed by a
+	// CA specified here may be enrolled (existing enrollments are
+	// unchanged).
+	//
+	// If not present, then the CA of TPM EKCerts will not be checked during
+	// enrollment, this allows any device to enroll.
+	EKCertAllowedCAs []string `yaml:"ekcert_allowed_cas,omitempty"`
 }
 
 func (dt *DeviceTrust) Parse() (*types.DeviceTrust, error) {
@@ -1347,10 +1215,96 @@ func (dt *DeviceTrust) Parse() (*types.DeviceTrust, error) {
 		}
 	}
 
+	allowedCAs, err := getCertificatePEMs(dt.EKCertAllowedCAs)
+	if err != nil {
+		return nil, trace.BadParameter("device_trust.ekcert_allowed_cas: %v", err)
+	}
+
 	return &types.DeviceTrust{
-		Mode:       dt.Mode,
-		AutoEnroll: autoEnroll,
+		Mode:             dt.Mode,
+		AutoEnroll:       autoEnroll,
+		EKCertAllowedCAs: allowedCAs,
 	}, nil
+}
+
+// HardwareKey holds settings related to hardware key support.
+// Requires Teleport Enterprise.
+type HardwareKey struct {
+	// PIVSlot is a PIV slot that Teleport clients should use instead of the
+	// default based on private key policy. For example, "9a" or "9e".
+	PIVSlot keys.PIVSlot `yaml:"piv_slot,omitempty"`
+
+	// SerialNumberValidation contains optional settings for hardware key
+	// serial number validation, including whether it is enabled.
+	SerialNumberValidation *HardwareKeySerialNumberValidation `yaml:"serial_number_validation,omitempty"`
+}
+
+func (h *HardwareKey) Parse() (*types.HardwareKey, error) {
+	if h.PIVSlot != "" {
+		if err := h.PIVSlot.Validate(); err != nil {
+			return nil, trace.Wrap(err, "failed to parse hardware_key.piv_slot")
+		}
+	}
+
+	hk := &types.HardwareKey{PIVSlot: string(h.PIVSlot)}
+
+	if h.SerialNumberValidation != nil {
+		var err error
+		hk.SerialNumberValidation, err = h.SerialNumberValidation.Parse()
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+
+	return hk, nil
+}
+
+// HardwareKeySerialNumberValidation holds settings related to hardware key serial number validation.
+// Requires Teleport Enterprise.
+type HardwareKeySerialNumberValidation struct {
+	// Enabled indicates whether hardware key serial number validation is enabled.
+	Enabled string `yaml:"enabled"`
+
+	// SerialNumberTraitName is an optional custom user trait name for hardware key
+	// serial numbers to replace the default: "hardware_key_serial_numbers".
+	SerialNumberTraitName string `yaml:"serial_number_trait_name"`
+}
+
+func (h *HardwareKeySerialNumberValidation) Parse() (*types.HardwareKeySerialNumberValidation, error) {
+	enabled, err := apiutils.ParseBool(h.Enabled)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return &types.HardwareKeySerialNumberValidation{
+		Enabled:               enabled,
+		SerialNumberTraitName: h.SerialNumberTraitName,
+	}, nil
+}
+
+// AssistOptions is a set of options common to both Auth and Proxy related to the Teleport Assist feature.
+type AssistOptions struct {
+	// OpenAI is a set of options related to the OpenAI assist backend.
+	OpenAI *OpenAIOptions `yaml:"openai,omitempty"`
+}
+
+// ProxyAssistOptions is a set of proxy service options related to the Assist feature
+type ProxyAssistOptions struct {
+	AssistOptions `yaml:",inline"`
+}
+
+// AuthAssistOptions is a set of auth service options related to the Assist feature
+type AuthAssistOptions struct {
+	AssistOptions `yaml:",inline"`
+	// CommandExecutionWorkers determines the number of workers that will
+	// execute arbitrary remote commands on servers (e.g. through Assist) in parallel
+	CommandExecutionWorkers int32 `yaml:"command_execution_workers,omitempty"`
+}
+
+// OpenAIOptions stores options related to the OpenAI assist backend.
+type OpenAIOptions struct {
+	// APITokenPath is the path to a file with OpenAI API key.
+	APITokenPath string `yaml:"api_token_path,omitempty"`
 }
 
 // HostedPlugins defines 'auth_service/plugins' Enterprise extension
@@ -1367,15 +1321,13 @@ type PluginOAuthProviders struct {
 
 func (p *PluginOAuthProviders) Parse() (servicecfg.PluginOAuthProviders, error) {
 	out := servicecfg.PluginOAuthProviders{}
-	if p.Slack == nil {
-		return out, trace.BadParameter("when plugin runtime is enabled, at least one plugin provider must be specified")
+	if p.Slack != nil {
+		slack, err := p.Slack.Parse()
+		if err != nil {
+			return out, trace.Wrap(err)
+		}
+		out.Slack = slack
 	}
-
-	slack, err := p.Slack.Parse()
-	if err != nil {
-		return out, trace.Wrap(err)
-	}
-	out.Slack = slack
 	return out, nil
 }
 
@@ -1529,6 +1481,12 @@ type Discovery struct {
 	// GCPMatchers are used to match GCP resources.
 	GCPMatchers []GCPMatcher `yaml:"gcp,omitempty"`
 
+	// KubernetesMatchers are used to match services inside Kubernetes cluster for auto discovery
+	KubernetesMatchers []KubernetesMatcher `yaml:"kubernetes,omitempty"`
+
+	// AccessGraph is used to configure the cloud sync into AccessGraph.
+	AccessGraph *AccessGraphSync `yaml:"access_graph,omitempty"`
+
 	// DiscoveryGroup is the name of the discovery group that the current
 	// discovery service is a part of.
 	// It is used to filter out discovered resources that belong to another
@@ -1537,18 +1495,45 @@ type Discovery struct {
 	// for all discovery services. If different agents are used to discover different
 	// sets of cloud resources, this field must be different for each set of agents.
 	DiscoveryGroup string `yaml:"discovery_group,omitempty"`
+	// PollInterval is the cadence at which the discovery server will run each of its
+	// discovery cycles.
+	PollInterval time.Duration `yaml:"poll_interval,omitempty"`
 }
 
 // GCPMatcher matches GCP resources.
 type GCPMatcher struct {
-	// Types are GKE resource types to match: "gke".
+	// Types are GKE resource types to match: "gke", "gce".
 	Types []string `yaml:"types,omitempty"`
 	// Locations are GKE locations to search resources for.
 	Locations []string `yaml:"locations,omitempty"`
-	// Tags are GCP labels to match.
+	// Labels are GCP labels to match.
+	Labels map[string]apiutils.Strings `yaml:"labels,omitempty"`
+	// Tags are an alias for Labels, for backwards compatibility.
 	Tags map[string]apiutils.Strings `yaml:"tags,omitempty"`
 	// ProjectIDs are the GCP project ID where the resources are deployed.
 	ProjectIDs []string `yaml:"project_ids,omitempty"`
+	// ServiceAccounts are the emails of service accounts attached to VMs.
+	ServiceAccounts []string `yaml:"service_accounts,omitempty"`
+	// InstallParams sets the join method when installing on
+	// discovered GCP VMs.
+	InstallParams *InstallParams `yaml:"install,omitempty"`
+}
+
+// AccessGraphSync represents the configuration for the AccessGraph Sync service.
+type AccessGraphSync struct {
+	// AWS is the AWS configuration for the AccessGraph Sync service.
+	AWS []AccessGraphAWSSync `yaml:"aws,omitempty"`
+}
+
+// AccessGraphAWSSync represents the configuration for the AWS AccessGraph Sync service.
+type AccessGraphAWSSync struct {
+	// Regions are AWS regions to poll for resources.
+	Regions []string `yaml:"regions,omitempty"`
+	// AssumeRoleARN is the AWS role to assume for database discovery.
+	AssumeRoleARN string `yaml:"assume_role_arn,omitempty"`
+	// ExternalID is the AWS external ID to use when assuming a role for
+	// database discovery in an external AWS account.
+	ExternalID string `yaml:"external_id,omitempty"`
 }
 
 // CommandLabel is `command` section of `ssh_service` in the config file
@@ -1606,6 +1591,10 @@ type BPF struct {
 
 	// CgroupPath controls where cgroupv2 hierarchy is mounted.
 	CgroupPath string `yaml:"cgroup_path"`
+
+	// RootPath root directory for the Teleport cgroups.
+	// Optional, defaults to /teleport
+	RootPath string `yaml:"root_path"`
 }
 
 // Parse will parse the enhanced session recording configuration.
@@ -1617,6 +1606,7 @@ func (b *BPF) Parse() *servicecfg.BPFConfig {
 		DiskBufferSize:    b.DiskBufferSize,
 		NetworkBufferSize: b.NetworkBufferSize,
 		CgroupPath:        b.CgroupPath,
+		RootPath:          b.RootPath,
 	}
 }
 
@@ -1628,19 +1618,6 @@ type RestrictedSession struct {
 	// EventsBufferSize is the size in bytes of the channel to report events
 	// from the kernel to us.
 	EventsBufferSize *int `yaml:"events_buffer_size,omitempty"`
-}
-
-// Parse will parse the enhanced session recording configuration.
-func (r *RestrictedSession) Parse() (*servicecfg.RestrictedSessionConfig, error) {
-	enabled, err := apiutils.ParseBool(r.Enabled)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	return &servicecfg.RestrictedSessionConfig{
-		Enabled:          enabled,
-		EventsBufferSize: r.EventsBufferSize,
-	}, nil
 }
 
 // X11 is a configuration for X11 forwarding
@@ -1675,6 +1652,18 @@ type Databases struct {
 type ResourceMatcher struct {
 	// Labels match resource labels.
 	Labels map[string]apiutils.Strings `yaml:"labels,omitempty"`
+	// AWS contains AWS specific settings.
+	AWS ResourceMatcherAWS `yaml:"aws,omitempty"`
+}
+
+// ResourceMatcherAWS contains AWS specific settings for resource matcher.
+type ResourceMatcherAWS struct {
+	// AssumeRoleARN is the AWS role to assume to before accessing the
+	// database.
+	AssumeRoleARN string `yaml:"assume_role_arn,omitempty"`
+	// ExternalID is an optional AWS external ID used to enable assuming an AWS
+	// role across accounts.
+	ExternalID string `yaml:"external_id,omitempty"`
 }
 
 // AWSMatcher matches AWS EC2 instances and AWS Databases
@@ -1697,6 +1686,12 @@ type AWSMatcher struct {
 	// SSM provides options to use when sending a document command to
 	// an EC2 node
 	SSM AWSSSM `yaml:"ssm,omitempty"`
+	// Integration is the integration name used to generate credentials to interact with AWS APIs.
+	// Environment credentials will not be used when this value is set.
+	Integration string `yaml:"integration"`
+	// KubeAppDiscovery controls whether Kubernetes App Discovery will be enabled for agents running on
+	// discovered clusters, currently only affects AWS EKS discovery in integration mode.
+	KubeAppDiscovery bool `yaml:"kube_app_discovery"`
 }
 
 // InstallParams sets join method to use on discovered nodes
@@ -1712,12 +1707,14 @@ type InstallParams struct {
 	// SSHDConfig provides the path to write sshd configuration changes
 	SSHDConfig string `yaml:"sshd_config,omitempty"`
 	// PublicProxyAddr is the address of the proxy the discovered node should use
-	// to connect to the cluster. Used ony in Azure.
+	// to connect to the cluster.
 	PublicProxyAddr string `yaml:"public_proxy_addr,omitempty"`
+	// Azure is te set of installation parameters specific to Azure.
+	Azure *AzureInstallParams `yaml:"azure,omitempty"`
 }
 
-func (ip *InstallParams) Parse() (services.InstallerParams, error) {
-	install := services.InstallerParams{
+func (ip *InstallParams) parse() (*types.InstallerParams, error) {
+	install := &types.InstallerParams{
 		JoinMethod:      ip.JoinParams.Method,
 		JoinToken:       ip.JoinParams.TokenName,
 		ScriptName:      ip.ScriptName,
@@ -1732,7 +1729,7 @@ func (ip *InstallParams) Parse() (services.InstallerParams, error) {
 	var err error
 	install.InstallTeleport, err = apiutils.ParseBool(ip.InstallTeleport)
 	if err != nil {
-		return services.InstallerParams{}, trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 
 	return install, nil
@@ -1743,6 +1740,12 @@ type AWSSSM struct {
 	// DocumentName is the name of the document to use when executing an
 	// SSM command
 	DocumentName string `yaml:"document_name,omitempty"`
+}
+
+// Azure is te set of installation parameters specific to Azure.
+type AzureInstallParams struct {
+	// ClientID is the client ID of the managed identity to use for installation.
+	ClientID string `yaml:"client_id"`
 }
 
 // AzureMatcher matches Azure resources.
@@ -1760,6 +1763,16 @@ type AzureMatcher struct {
 	// InstallParams sets the join method when installing on
 	// discovered Azure nodes.
 	InstallParams *InstallParams `yaml:"install,omitempty"`
+}
+
+// KubernetesMatcher matches Kubernetes resources.
+type KubernetesMatcher struct {
+	// Types are Kubernetes services types to match. Currently only 'app' is supported.
+	Types []string `yaml:"types,omitempty"`
+	// Namespaces are Kubernetes namespaces in which to discover services
+	Namespaces []string `yaml:"namespaces,omitempty"`
+	// Labels are Kubernetes services labels to match.
+	Labels map[string]apiutils.Strings `yaml:"labels,omitempty"`
 }
 
 // Database represents a single database proxied by the service.
@@ -1791,6 +1804,22 @@ type Database struct {
 	AD DatabaseAD `yaml:"ad"`
 	// Azure contains Azure database configuration.
 	Azure DatabaseAzure `yaml:"azure"`
+	// AdminUser describes database privileged user for auto-provisioning.
+	AdminUser DatabaseAdminUser `yaml:"admin_user"`
+	// Oracle is Database Oracle settings
+	Oracle DatabaseOracle `yaml:"oracle,omitempty"`
+}
+
+// DatabaseAdminUser describes database privileged user for auto-provisioning.
+type DatabaseAdminUser struct {
+	// Name is the database admin username (e.g. "postgres").
+	Name string `yaml:"name"`
+	// DefaultDatabase is the database that the admin user logs into by
+	// default.
+	//
+	// Depending on the database type, this database may be used to store
+	// procedures or data for managing database users.
+	DefaultDatabase string `yaml:"default_database"`
 }
 
 // DatabaseAD contains database Active Directory configuration.
@@ -1827,6 +1856,12 @@ type DatabaseMySQL struct {
 	ServerVersion string `yaml:"server_version,omitempty"`
 }
 
+// DatabaseOracle are an additional Oracle database options.
+type DatabaseOracle struct {
+	// AuditUser is the Oracle database user privilege to access internal Oracle audit trail.
+	AuditUser string `yaml:"audit_user,omitempty"`
+}
+
 // SecretStore contains settings for managing secrets.
 type SecretStore struct {
 	// KeyPrefix specifies the secret key prefix.
@@ -1857,6 +1892,8 @@ type DatabaseAWS struct {
 	ExternalID string `yaml:"external_id,omitempty"`
 	// RedshiftServerless contains RedshiftServerless specific settings.
 	RedshiftServerless DatabaseAWSRedshiftServerless `yaml:"redshift_serverless"`
+	// SessionTags is a list of AWS STS session tags.
+	SessionTags map[string]string `yaml:"session_tags,omitempty"`
 }
 
 // DatabaseAWSRedshift contains AWS Redshift specific settings.
@@ -1969,6 +2006,8 @@ type Rewrite struct {
 	Redirect []string `yaml:"redirect"`
 	// Headers is a list of extra headers to inject in the request.
 	Headers []string `yaml:"headers,omitempty"`
+	// JWTClaims configures whether roles/traits are included in the JWT token
+	JWTClaims string `yaml:"jwt_claims,omitempty"`
 }
 
 // AppAWS contains additional options for AWS applications.
@@ -1994,7 +2033,7 @@ type Proxy struct {
 	KeyFile string `yaml:"https_key_file,omitempty"`
 	// CertFile is a TLS Certificate file
 	CertFile string `yaml:"https_cert_file,omitempty"`
-	// ProxyProtocol turns on support for HAProxy proxy protocol
+	// ProxyProtocol turns on support for HAProxy PROXY protocol
 	// this is the option that has be turned on only by administrator,
 	// as only admin knows whether service is in front of trusted load balancer
 	// or not.
@@ -2060,6 +2099,19 @@ type Proxy struct {
 
 	// UI provides config options for the web UI
 	UI *UIConfig `yaml:"ui,omitempty"`
+
+	// Assist is a set of options related to the Teleport Assist feature.
+	Assist *ProxyAssistOptions `yaml:"assist,omitempty"`
+
+	// TrustXForwardedFor enables the service to take client source IPs from
+	// the "X-Forwarded-For" headers for web APIs received from layer 7 load
+	// balancers or reverse proxies.
+	TrustXForwardedFor types.Bool `yaml:"trust_x_forwarded_for,omitempty"`
+
+	// AutomaticUpgradesChannels is a map of all version channels used by the
+	// proxy built-in version server to retrieve target versions. This is part
+	// of the automatic upgrades.
+	AutomaticUpgradesChannels automaticupgrades.Channels `yaml:"automatic_upgrades_channels,omitempty"`
 }
 
 // UIConfig provides config options for the web UI served by the proxy service.
@@ -2229,10 +2281,10 @@ type Metrics struct {
 	// mTLS will be enabled for the service if both 'keypairs' and 'ca_certs' fields are set.
 	CACerts []string `yaml:"ca_certs,omitempty"`
 
-	// GRPCServerLatency enables histogram metrics for each grpc endpoint on the auth server
+	// GRPCServerLatency enables histogram metrics for each gRPC endpoint on the auth server
 	GRPCServerLatency bool `yaml:"grpc_server_latency,omitempty"`
 
-	// GRPCServerLatency enables histogram metrics for each grpc endpoint on the auth server
+	// GRPCServerLatency enables histogram metrics for each gRPC endpoint on the auth server
 	GRPCClientLatency bool `yaml:"grpc_client_latency,omitempty"`
 }
 
@@ -2253,15 +2305,28 @@ type WindowsDesktopService struct {
 	ShowDesktopWallpaper bool `yaml:"show_desktop_wallpaper,omitempty"`
 	// LDAP is the LDAP connection parameters.
 	LDAP LDAPConfig `yaml:"ldap"`
+	// PKIDomain optionally configures a separate Active Directory domain
+	// for PKI operations. If empty, the domain from the LDAP config is used.
+	// This can be useful for cases where PKI is configured in a root domain
+	// but Teleport is used to provide access to users and computers in a child
+	// domain.
+	PKIDomain string `yaml:"pki_domain"`
 	// Discovery configures desktop discovery via LDAP.
 	Discovery LDAPDiscoveryConfig `yaml:"discovery,omitempty"`
-	// Hosts is a list of static, AD-connected Windows hosts. This gives users
+	// ADHosts is a list of static, AD-connected Windows hosts. This gives users
 	// a way to specify AD-connected hosts that won't be found by the filters
 	// specified in `discovery` (or if `discovery` is omitted).
-	Hosts []string `yaml:"hosts,omitempty"`
+	//
+	// Deprecated: prefer StaticHosts instead.
+	ADHosts []string `yaml:"hosts,omitempty"`
 	// NonADHosts is a list of standalone Windows hosts that are not
 	// jointed to an Active Directory domain.
+	//
+	// Deprecated: prefer StaticHosts instead.
 	NonADHosts []string `yaml:"non_ad_hosts,omitempty"`
+	// StaticHosts is a list of Windows hosts (both AD-connected and standalone).
+	// User can specify name for each host and labels specific to it.
+	StaticHosts []WindowsHost `yaml:"static_hosts,omitempty"`
 	// HostLabels optionally applies labels to Windows hosts for RBAC.
 	// A host can match multiple rules and will get a union of all
 	// the matched labels.
@@ -2270,9 +2335,13 @@ type WindowsDesktopService struct {
 
 // Check checks whether the WindowsDesktopService is valid or not
 func (wds *WindowsDesktopService) Check() error {
-	if len(wds.Hosts) > 0 && wds.LDAP.Addr == "" {
-		return trace.BadParameter("if hosts are specified in the windows_desktop_service, " +
-			"the ldap configuration for their corresponding Active Directory domain controller must also be specified")
+	hasAD := len(wds.ADHosts) > 0 || slices.ContainsFunc(wds.StaticHosts, func(host WindowsHost) bool {
+		return host.AD
+	})
+
+	if hasAD && wds.LDAP.Addr == "" {
+		return trace.BadParameter("if Active Directory hosts are specified in the windows_desktop_service, " +
+			"the ldap configuration must also be specified")
 	}
 
 	if wds.Discovery.BaseDN != "" && wds.LDAP.Addr == "" {
@@ -2283,7 +2352,7 @@ func (wds *WindowsDesktopService) Check() error {
 	return nil
 }
 
-// WindowsHostLabelRule describes how a set of labels should be a applied to
+// WindowsHostLabelRule describes how a set of labels should be applied to
 // a Windows host.
 type WindowsHostLabelRule struct {
 	// Match is a regexp that is checked against the Windows host's DNS name.
@@ -2291,6 +2360,19 @@ type WindowsHostLabelRule struct {
 	Match string `yaml:"match"`
 	// Labels is the set of labels to apply to hosts that match this rule.
 	Labels map[string]string `yaml:"labels"`
+}
+
+// WindowsHost describes single host in configuration
+type WindowsHost struct {
+	// Name of the host
+	Name string `yaml:"name"`
+	// Address of the host, with an optional port.
+	// 10.1.103.4 or 10.1.103.4:3389, for example.
+	Address string `yaml:"addr"`
+	// Labels is the set of labels to apply to this host
+	Labels map[string]string `yaml:"labels"`
+	// AD tells if host is part of Active Directory domain
+	AD bool `yaml:"ad"`
 }
 
 // LDAPConfig is the LDAP connection parameters.
@@ -2369,4 +2451,164 @@ type Okta struct {
 
 	// APITokenPath is the path to the Okta API token.
 	APITokenPath string `yaml:"api_token_path,omitempty"`
+
+	// SyncPeriod is the duration between synchronization calls for synchronizing Okta applications and groups..
+	// Deprecated. Please use sync.app_group_sync_period instead.
+	SyncPeriod time.Duration `yaml:"sync_period,omitempty"`
+
+	// Import is the import settings for the Okta service.
+	Sync OktaSync `yaml:"sync,omitempty"`
+}
+
+// OktaSync represents the import subsection of the okta_service section in the config file.
+type OktaSync struct {
+	// AppGroupSyncPeriod is the duration between synchronization calls for synchronizing Okta applications and groups.
+	AppGroupSyncPeriod time.Duration `yaml:"app_group_sync_period,omitempty"`
+
+	// SyncAccessLists will enable or disable the Okta importing of access lists. Defaults to false.
+	SyncAccessListsFlag string `yaml:"sync_access_lists,omitempty"`
+
+	// DefaultOwners are the default owners for all imported access lists.
+	DefaultOwners []string `yaml:"default_owners,omitempty"`
+
+	// GroupFilters are filters for which Okta groups to synchronize as access lists.
+	// These are globs/regexes.
+	GroupFilters []string `yaml:"group_filters,omitempty"`
+
+	// AppFilters are filters for which Okta applications to synchronize as access lists.
+	// These are globs/regexes.
+	AppFilters []string `yaml:"app_filters,omitempty"`
+}
+
+func (o *OktaSync) SyncAccessLists() bool {
+	if o.SyncAccessListsFlag == "" {
+		return false
+	}
+	enabled, _ := apiutils.ParseBool(o.SyncAccessListsFlag)
+	return enabled
+}
+
+func (o *OktaSync) Parse() (*servicecfg.OktaSyncSettings, error) {
+	enabled := o.SyncAccessLists()
+	if enabled && len(o.DefaultOwners) == 0 {
+		return nil, trace.BadParameter("default owners must be set when access list import is enabled")
+	}
+
+	for _, filter := range o.GroupFilters {
+		_, err := utils.CompileExpression(filter)
+		if err != nil {
+			return nil, trace.Wrap(err, "error parsing group filter: %s", filter)
+		}
+	}
+
+	for _, filter := range o.AppFilters {
+		_, err := utils.CompileExpression(filter)
+		if err != nil {
+			return nil, trace.Wrap(err, "error parsing app filter: %s", filter)
+		}
+	}
+
+	return &servicecfg.OktaSyncSettings{
+		AppGroupSyncPeriod: o.AppGroupSyncPeriod,
+		SyncAccessLists:    o.SyncAccessLists(),
+		DefaultOwners:      o.DefaultOwners,
+		GroupFilters:       o.GroupFilters,
+		AppFilters:         o.AppFilters,
+	}, nil
+}
+
+// JamfService is the yaml representation of jamf_service.
+// Corresponds to [types.JamfSpecV1].
+type JamfService struct {
+	Service `yaml:",inline"`
+	// Name is the name of the sync device source.
+	Name string `yaml:"name,omitempty"`
+	// SyncDelay is the initial sync delay.
+	// Zero means "server default", negative means "immediate".
+	SyncDelay time.Duration `yaml:"sync_delay,omitempty"`
+	// ExitOnSync tells the service to exit immediately after the first sync.
+	ExitOnSync bool `yaml:"exit_on_sync,omitempty"`
+	// APIEndpoint is the Jamf Pro API endpoint.
+	// Example: "https://yourtenant.jamfcloud.com/api".
+	APIEndpoint string `yaml:"api_endpoint,omitempty"`
+	// Username is the Jamf Pro API username.
+	Username string `yaml:"username,omitempty"`
+	// PasswordFile is a file containing the  Jamf Pro API password.
+	// A single trailing newline is trimmed, anything else is taken literally.
+	PasswordFile string `yaml:"password_file,omitempty"`
+	// Inventory are the entries for inventory sync.
+	Inventory []*JamfInventoryEntry `yaml:"inventory,omitempty"`
+}
+
+// JamfInventoryEntry is the yaml representation of a jamf_service.inventory
+// entry.
+// Corresponds to [types.JamfInventoryEntry].
+type JamfInventoryEntry struct {
+	// FilterRSQL is a Jamf Pro API RSQL filter string.
+	FilterRSQL string `yaml:"filter_rsql,omitempty"`
+	// SyncPeriodPartial is the period for PARTIAL syncs.
+	// Zero means "server default", negative means "disabled".
+	SyncPeriodPartial time.Duration `yaml:"sync_period_partial,omitempty"`
+	// SyncPeriodFull is the period for FULL syncs.
+	// Zero means "server default", negative means "disabled".
+	SyncPeriodFull time.Duration `yaml:"sync_period_full,omitempty"`
+	// OnMissing is the trigger for devices missing from the MDM inventory view.
+	// See [types.JamfInventoryEntry.OnMissing].
+	OnMissing string `yaml:"on_missing,omitempty"`
+	// Custom page size for inventory queries.
+	// A server default is used if zeroed or negative.
+	PageSize int32 `yaml:"page_size,omitempty"`
+}
+
+func (j *JamfService) toJamfSpecV1() (*types.JamfSpecV1, error) {
+	switch {
+	case j == nil:
+		return nil, trace.BadParameter("jamf_service is nil")
+	case j.ListenAddress != "":
+		return nil, trace.BadParameter("jamf listen_addr not supported")
+	case j.PasswordFile == "":
+		return nil, trace.BadParameter("jamf password_file required")
+	}
+
+	// Read password from file.
+	pwdBytes, err := os.ReadFile(j.PasswordFile)
+	if err != nil {
+		return nil, trace.BadParameter("jamf password_file: %v", err)
+	}
+	pwd := string(pwdBytes)
+	if pwd == "" {
+		return nil, trace.BadParameter("jamf password_file is empty")
+	}
+	// Trim trailing \n?
+	if l := len(pwd); pwd[l-1] == '\n' {
+		pwd = pwd[:l-1]
+	}
+
+	// Assemble spec.
+	inventory := make([]*types.JamfInventoryEntry, len(j.Inventory))
+	for i, e := range j.Inventory {
+		inventory[i] = &types.JamfInventoryEntry{
+			FilterRsql:        e.FilterRSQL,
+			SyncPeriodPartial: types.Duration(e.SyncPeriodPartial),
+			SyncPeriodFull:    types.Duration(e.SyncPeriodFull),
+			OnMissing:         e.OnMissing,
+			PageSize:          e.PageSize,
+		}
+	}
+	spec := &types.JamfSpecV1{
+		Enabled:     j.Enabled(),
+		Name:        j.Name,
+		SyncDelay:   types.Duration(j.SyncDelay),
+		ApiEndpoint: j.APIEndpoint,
+		Username:    j.Username,
+		Password:    pwd,
+		Inventory:   inventory,
+	}
+
+	// Validate.
+	if err := types.ValidateJamfSpecV1(spec); err != nil {
+		return nil, trace.BadParameter("jamf_service %v", err)
+	}
+
+	return spec, nil
 }

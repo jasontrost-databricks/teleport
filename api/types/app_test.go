@@ -27,7 +27,7 @@ import (
 )
 
 // TestAppPublicAddrValidation tests PublicAddr field validation to make sure that
-// an app with internal "kube." ServerName prefix won't be created.
+// an app with internal "kube-teleport-proxy-alpn." ServerName prefix won't be created.
 func TestAppPublicAddrValidation(t *testing.T) {
 	type check func(t *testing.T, err error)
 
@@ -38,7 +38,7 @@ func TestAppPublicAddrValidation(t *testing.T) {
 	}
 	hasErrTypeBadParameter := func() check {
 		return func(t *testing.T, err error) {
-			require.IsType(t, &trace.BadParameterError{}, err.(*trace.TraceErr).OrigError())
+			require.True(t, trace.IsBadParameter(err))
 		}
 	}
 
@@ -69,12 +69,12 @@ func TestAppPublicAddrValidation(t *testing.T) {
 		},
 		{
 			name:       "public address with internal kube ServerName prefix",
-			publicAddr: "kube.example.com:3080",
+			publicAddr: constants.KubeTeleportProxyALPNPrefix + "example.com:3080",
 			check:      hasErrTypeBadParameter(),
 		},
 		{
 			name:       "https public address with internal kube ServerName prefix",
-			publicAddr: "https://kube.example.com:3080",
+			publicAddr: "https://" + constants.KubeTeleportProxyALPNPrefix + "example.com:3080",
 			check:      hasErrTypeBadParameter(),
 		},
 	}
@@ -309,7 +309,8 @@ func TestNewAppV3(t *testing.T) {
 			want: &AppV3{
 				Kind:    "app",
 				Version: "v3",
-				Metadata: Metadata{Name: "myapp",
+				Metadata: Metadata{
+					Name:        "myapp",
 					Namespace:   "default",
 					Description: "my fancy app",
 					ID:          123,
@@ -371,6 +372,18 @@ func TestNewAppV3(t *testing.T) {
 				Version:  "v3",
 				Metadata: Metadata{Name: "myaws", Namespace: "default"},
 				Spec:     AppSpecV3{URI: constants.AWSConsoleURL, Cloud: CloudAWS},
+			},
+			wantErr: require.NoError,
+		},
+		{
+			name: "aws app using integration",
+			meta: Metadata{Name: "myaws"},
+			spec: AppSpecV3{Cloud: CloudAWS, URI: constants.AWSConsoleURL, Integration: "my-integration"},
+			want: &AppV3{
+				Kind:     "app",
+				Version:  "v3",
+				Metadata: Metadata{Name: "myaws", Namespace: "default"},
+				Spec:     AppSpecV3{URI: constants.AWSConsoleURL, Cloud: CloudAWS, Integration: "my-integration"},
 			},
 			wantErr: require.NoError,
 		},

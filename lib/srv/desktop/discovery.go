@@ -1,23 +1,30 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package desktop
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -35,15 +42,15 @@ import (
 // startDesktopDiscovery starts fetching desktops from LDAP, periodically
 // registering and unregistering them as necessary.
 func (s *WindowsService) startDesktopDiscovery() error {
-	reconciler, err := services.NewReconciler(services.ReconcilerConfig{
+	reconciler, err := services.NewReconciler(services.ReconcilerConfig[types.WindowsDesktop]{
 		// Use a matcher that matches all resources, since our desktops are
 		// pre-filtered by nature of using an LDAP search with filters.
-		Matcher: func(r types.ResourceWithLabels) bool { return true },
+		Matcher: func(d types.WindowsDesktop) bool { return true },
 
-		GetCurrentResources: func() types.ResourcesWithLabelsMap { return s.lastDiscoveryResults },
+		GetCurrentResources: func() map[string]types.WindowsDesktop { return s.lastDiscoveryResults },
 		GetNewResources:     s.getDesktopsFromLDAP,
 		OnCreate:            s.upsertDesktop,
-		OnUpdate:            s.upsertDesktop,
+		OnUpdate:            s.updateDesktop,
 		OnDelete:            s.deleteDesktop,
 		Log:                 s.cfg.Log,
 	})
@@ -55,7 +62,7 @@ func (s *WindowsService) startDesktopDiscovery() error {
 		// reconcile once before starting the ticker, so that desktops show up immediately
 		// (we still have a small delay to give the LDAP client time to initialize)
 		time.Sleep(15 * time.Second)
-		if err := reconciler.Reconcile(s.closeCtx); err != nil && err != context.Canceled {
+		if err := reconciler.Reconcile(s.closeCtx); err != nil && !errors.Is(err, context.Canceled) {
 			s.cfg.Log.Errorf("desktop reconciliation failed: %v", err)
 		}
 
@@ -68,7 +75,7 @@ func (s *WindowsService) startDesktopDiscovery() error {
 			case <-s.closeCtx.Done():
 				return
 			case <-t.Chan():
-				if err := reconciler.Reconcile(s.closeCtx); err != nil && err != context.Canceled {
+				if err := reconciler.Reconcile(s.closeCtx); err != nil && !errors.Is(err, context.Canceled) {
 					s.cfg.Log.Errorf("desktop reconciliation failed: %v", err)
 				}
 			}
@@ -88,7 +95,7 @@ func (s *WindowsService) ldapSearchFilter() string {
 }
 
 // getDesktopsFromLDAP discovers Windows hosts via LDAP
-func (s *WindowsService) getDesktopsFromLDAP() types.ResourcesWithLabelsMap {
+func (s *WindowsService) getDesktopsFromLDAP() map[string]types.WindowsDesktop {
 	if !s.ldapReady() {
 		s.cfg.Log.Warn("skipping desktop discovery: LDAP not yet initialized")
 		return nil
@@ -119,7 +126,7 @@ func (s *WindowsService) getDesktopsFromLDAP() types.ResourcesWithLabelsMap {
 
 	s.cfg.Log.Debugf("discovered %d Windows Desktops", len(entries))
 
-	result := make(types.ResourcesWithLabelsMap)
+	result := make(map[string]types.WindowsDesktop)
 	for _, entry := range entries {
 		desktop, err := s.ldapEntryToWindowsDesktop(s.closeCtx, entry, s.cfg.HostLabelsFn)
 		if err != nil {
@@ -135,77 +142,124 @@ func (s *WindowsService) getDesktopsFromLDAP() types.ResourcesWithLabelsMap {
 	return result
 }
 
-func (s *WindowsService) upsertDesktop(ctx context.Context, r types.ResourceWithLabels) error {
-	d, ok := r.(types.WindowsDesktop)
-	if !ok {
-		return trace.Errorf("upsert: expected a WindowsDesktop, got %T", r)
-	}
+func (s *WindowsService) updateDesktop(ctx context.Context, desktop, _ types.WindowsDesktop) error {
+	return s.upsertDesktop(ctx, desktop)
+}
+
+func (s *WindowsService) upsertDesktop(ctx context.Context, d types.WindowsDesktop) error {
 	return s.cfg.AuthClient.UpsertWindowsDesktop(ctx, d)
 }
 
-func (s *WindowsService) deleteDesktop(ctx context.Context, r types.ResourceWithLabels) error {
-	d, ok := r.(types.WindowsDesktop)
-	if !ok {
-		return trace.Errorf("delete: expected a WindowsDesktop, got %T", r)
-	}
+func (s *WindowsService) deleteDesktop(ctx context.Context, d types.WindowsDesktop) error {
 	return s.cfg.AuthClient.DeleteWindowsDesktop(ctx, d.GetHostID(), d.GetName())
 }
 
 func (s *WindowsService) applyLabelsFromLDAP(entry *ldap.Entry, labels map[string]string) {
 	// apply common LDAP labels by default
 	labels[types.OriginLabel] = types.OriginDynamic
-	labels[types.TeleportNamespace+"/dns_host_name"] = entry.GetAttributeValue(windows.AttrDNSHostName)
-	labels[types.TeleportNamespace+"/computer_name"] = entry.GetAttributeValue(windows.AttrName)
-	labels[types.TeleportNamespace+"/os"] = entry.GetAttributeValue(windows.AttrOS)
-	labels[types.TeleportNamespace+"/os_version"] = entry.GetAttributeValue(windows.AttrOSVersion)
+	labels[types.DiscoveryLabelWindowsDNSHostName] = entry.GetAttributeValue(windows.AttrDNSHostName)
+	labels[types.DiscoveryLabelWindowsComputerName] = entry.GetAttributeValue(windows.AttrName)
+	labels[types.DiscoveryLabelWindowsOS] = entry.GetAttributeValue(windows.AttrOS)
+	labels[types.DiscoveryLabelWindowsOSVersion] = entry.GetAttributeValue(windows.AttrOSVersion)
 
 	// attempt to compute the desktop's OU from its DN
 	dn := entry.GetAttributeValue(windows.AttrDistinguishedName)
 	cn := entry.GetAttributeValue(windows.AttrCommonName)
 	if len(dn) > 0 && len(cn) > 0 {
 		ou := strings.TrimPrefix(dn, "CN="+cn+",")
-		labels[types.TeleportNamespace+"/ou"] = ou
+		labels[types.DiscoveryLabelWindowsOU] = ou
 	}
 
 	// label domain controllers
 	switch entry.GetAttributeValue(windows.AttrPrimaryGroupID) {
 	case windows.WritableDomainControllerGroupID, windows.ReadOnlyDomainControllerGroupID:
-		labels[types.TeleportNamespace+"/is_domain_controller"] = "true"
+		labels[types.DiscoveryLabelWindowsIsDomainController] = "true"
 	}
 
 	// apply any custom labels per the discovery configuration
 	for _, attr := range s.cfg.DiscoveryLDAPAttributeLabels {
 		if v := entry.GetAttributeValue(attr); v != "" {
-			labels["ldap/"+attr] = v
+			labels[types.DiscoveryLabelLDAPPrefix+attr] = v
 		}
 	}
 }
 
+const dnsQueryTimeout = 5 * time.Second
+
 // lookupDesktop does a DNS lookup for the provided hostname.
 // It checks using the default system resolver first, and falls
-// back to making a DNS query of the configured LDAP server
-// if the system resolver fails.
-func (s *WindowsService) lookupDesktop(ctx context.Context, hostname string) (addrs []string, err error) {
-	tctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
+// back to the configured LDAP server if the system resolver fails.
+func (s *WindowsService) lookupDesktop(ctx context.Context, hostname string) ([]string, error) {
+	stringAddrs := func(addrs []netip.Addr) []string {
+		result := make([]string, 0, len(addrs))
+		for _, addr := range addrs {
+			result = append(result, addr.String())
+		}
+		return result
+	}
 
-	addrs, err = net.DefaultResolver.LookupHost(tctx, hostname)
-	if err == nil && len(addrs) > 0 {
-		return addrs, nil
+	queryResolver := func(resolver *net.Resolver, resolverName string) chan []netip.Addr {
+		ch := make(chan []netip.Addr, 1)
+		go func() {
+			tctx, cancel := context.WithTimeout(ctx, dnsQueryTimeout)
+			defer cancel()
+
+			addrs, err := resolver.LookupNetIP(tctx, "ip4", hostname)
+			if err != nil {
+				s.cfg.Log.Debugf("DNS lookup for %v failed with %s resolver: %v",
+					hostname, resolverName, err)
+			}
+
+			// even though we requested "ip4" it's possible to get IPv4
+			// addresses mapped to IPv6 addresses, so we unmap them here
+			result := make([]netip.Addr, 0, len(addrs))
+			for _, addr := range addrs {
+				if addr.Is4() || addr.Is4In6() {
+					result = append(result, addr.Unmap())
+				}
+			}
+
+			ch <- result
+		}()
+		return ch
 	}
-	if s.dnsResolver == nil {
-		return nil, trace.NewAggregate(err, trace.Errorf("DNS lookup for %v failed and there's no LDAP server to fallback to", hostname))
+
+	// kick off both DNS queries in parallel
+	defaultResult := queryResolver(net.DefaultResolver, "default")
+	ldapResult := queryResolver(s.dnsResolver, "LDAP")
+
+	// wait for the default resolver to return (or time out)
+	addrs := <-defaultResult
+	if len(addrs) > 0 {
+		return stringAddrs(addrs), nil
 	}
-	s.cfg.Log.WithError(err).Debugf("DNS lookup for %v failed, falling back to LDAP server", hostname)
-	return s.dnsResolver.LookupHost(ctx, hostname)
+
+	// If we didn't get a result from the default resolver,
+	// use the result from the LDAP resolver.
+	// This shouldn't block for very long, since both operations
+	// started at the same time with the same timeout.
+	addrs = <-ldapResult
+	if len(addrs) > 0 {
+		return stringAddrs(addrs), nil
+	}
+
+	return nil, trace.Errorf("could not resolve %v in time", hostname)
 }
 
 // ldapEntryToWindowsDesktop generates the Windows Desktop resource
 // from an LDAP search result
-func (s *WindowsService) ldapEntryToWindowsDesktop(ctx context.Context, entry *ldap.Entry, getHostLabels func(string) map[string]string) (types.ResourceWithLabels, error) {
+func (s *WindowsService) ldapEntryToWindowsDesktop(ctx context.Context, entry *ldap.Entry, getHostLabels func(string) map[string]string) (types.WindowsDesktop, error) {
 	hostname := entry.GetAttributeValue(windows.AttrDNSHostName)
+	if hostname == "" {
+		attrs := make([]string, len(entry.Attributes))
+		for _, a := range entry.Attributes {
+			attrs = append(attrs, fmt.Sprintf("%v=%v", a.Name, a.Values))
+		}
+		s.cfg.Log.Debugf("LDAP entry %v is missing hostname, has attributes %v", entry.DN, strings.Join(attrs, ","))
+		return nil, trace.BadParameter("LDAP entry %v missing hostname", entry.DN)
+	}
 	labels := getHostLabels(hostname)
-	labels[types.TeleportNamespace+"/windows_domain"] = s.cfg.Domain
+	labels[types.DiscoveryLabelWindowsDomain] = s.cfg.Domain
 	s.applyLabelsFromLDAP(entry, labels)
 
 	addrs, err := s.lookupDesktop(ctx, hostname)
@@ -219,10 +273,18 @@ func (s *WindowsService) ldapEntryToWindowsDesktop(ctx context.Context, entry *l
 		return nil, trace.Wrap(err)
 	}
 
+	// ensure no '.' in name, because we use SNI to route to the right
+	// desktop, and our cert is valid for *.desktop.teleport.cluster.local
+	name := strings.ReplaceAll(hostname, ".", "-")
+
+	// append portion of the object GUID to ensure that desktops from
+	// different domains that happen to have the same hostname don't conflict
+	if guid := entry.GetRawAttributeValue(windows.AttrObjectGUID); len(guid) >= 4 {
+		name += "-" + hex.EncodeToString(guid[:4])
+	}
+
 	desktop, err := types.NewWindowsDesktopV3(
-		// ensure no '.' in name, because we use SNI to route to the right
-		// desktop, and our cert is valid for *.desktop.teleport.cluster.local
-		strings.ReplaceAll(hostname, ".", "-"),
+		name,
 		labels,
 		types.WindowsDesktopSpecV3{
 			Addr:   addr.String(),
@@ -234,6 +296,9 @@ func (s *WindowsService) ldapEntryToWindowsDesktop(ctx context.Context, entry *l
 		return nil, trace.Wrap(err)
 	}
 
-	desktop.SetExpiry(s.cfg.Clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL))
+	// We use a longer TTL for discovered desktops, because the reconciler will manually
+	// purge them if they stop being detected, and discovery of large Windows fleets can
+	// take a long time.
+	desktop.SetExpiry(s.cfg.Clock.Now().UTC().Add(apidefaults.ServerAnnounceTTL * 3))
 	return desktop, nil
 }

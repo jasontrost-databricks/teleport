@@ -1,18 +1,20 @@
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -35,6 +37,9 @@ type Event struct {
 //     eg: All user related events are grouped under 1xxx.
 //
 //   - Suffix code with one of these letters: I (info), W (warn), E (error).
+//
+// After defining an event code, make sure to keep
+// `web/packages/teleport/src/services/audit/types.ts` in sync.
 const (
 	// UserLocalLoginCode is the successful local user login event code.
 	UserLocalLoginCode = "T1000I"
@@ -68,6 +73,22 @@ const (
 	UserSSOTestFlowLoginCode = "T1010I"
 	// UserSSOTestFlowLoginFailureCode is the unsuccessful SSO test flow user login event code.
 	UserSSOTestFlowLoginFailureCode = "T1011W"
+	// UserHeadlessLoginRequestedCode is an event code for when headless login attempt was requested.
+	UserHeadlessLoginRequestedCode = "T1012I"
+	// UserHeadlessLoginApprovedCode is an event code for when headless login attempt was successfully approved.
+	UserHeadlessLoginApprovedCode = "T1013I"
+	// UserHeadlessLoginApprovedFailureCode is an event code for when headless login was approved with an error.
+	UserHeadlessLoginApprovedFailureCode = "T1013W"
+	// UserHeadlessLoginRejectedCode is an event code for when headless login attempt was rejected.
+	UserHeadlessLoginRejectedCode = "T1014W"
+	// CreateMFAAuthChallenge is an event code for when an MFA auth challenge is created.
+	CreateMFAAuthChallengeCode = "T1015I"
+	// ValidateMFAAuthResponseCode is an event code for when an MFA auth challenge
+	// response is successfully validated.
+	ValidateMFAAuthResponseCode = "T1016I"
+	// VValidateMFAAuthResponseFailureCode is an event code for when an MFA auth challenge
+	// response fails validation.
+	ValidateMFAAuthResponseFailureCode = "T1016W"
 
 	// BillingCardCreateCode is an event code for when a user creates a new credit card.
 	BillingCardCreateCode = "TBL00I"
@@ -130,6 +151,16 @@ const (
 	DatabaseSessionQueryFailedCode = "TDB02W"
 	// DatabaseSessionMalformedPacketCode is the db.session.malformed_packet event code.
 	DatabaseSessionMalformedPacketCode = "TDB06I"
+	// DatabaseSessionPermissionUpdateCode is the db.session.permissions.update event code.
+	DatabaseSessionPermissionUpdateCode = "TDB07I"
+	// DatabaseSessionUserCreateCode is the db.session.user.create event code.
+	DatabaseSessionUserCreateCode = "TDB08I"
+	// DatabaseSessionUserCreateFailureCode is the db.session.user.create event failure code.
+	DatabaseSessionUserCreateFailureCode = "TDB08W"
+	// DatabaseSessionUserDeactivateCode is the db.session.user.deactivate event code.
+	DatabaseSessionUserDeactivateCode = "TDB09I"
+	// DatabaseSessionUserDeactivateFailureCode is the db.session.user.deactivate event failure code.
+	DatabaseSessionUserDeactivateFailureCode = "TDB09W"
 
 	// PostgresParseCode is the db.session.postgres.statements.parse event code.
 	PostgresParseCode = "TPG00I"
@@ -269,6 +300,8 @@ const (
 	// Note: some requests (like exec into a pod) use other codes (like
 	// ExecCode).
 	KubeRequestCode = "T3009I"
+	// SCPDisallowedCode is the SCP disallowed event code.
+	SCPDisallowedCode = "T3010E"
 
 	// KubernetesClusterCreateCode is the kube.create event code.
 	KubernetesClusterCreateCode = "T3010I"
@@ -316,6 +349,7 @@ const (
 	SFTPSymlinkFailureCode  = "TS018E"
 	SFTPLinkCode            = "TS019I"
 	SFTPLinkFailureCode     = "TS019E"
+	SFTPDisallowedCode      = "TS020E"
 
 	// SessionCommandCode is a session command code.
 	SessionCommandCode = "T4000I"
@@ -346,34 +380,55 @@ const (
 	TrustedClusterCreateCode = "T7000I"
 	// TrustedClusterDeleteCode is the event code for removing a trusted cluster.
 	TrustedClusterDeleteCode = "T7001I"
-	// TrustedClusterTokenCreateCode is the event code for
-	// creating new join token for a trusted cluster.
+	// TrustedClusterTokenCreateCode is the event code for creating new
+	// provisioning token for a trusted cluster. Deprecated in favor of
+	// [ProvisionTokenCreateEvent].
 	TrustedClusterTokenCreateCode = "T7002I"
+
+	// ProvisionTokenCreateCode is the event code for creating a provisioning
+	// token, also known as Join Token. See
+	// [github.com/gravitational/teleport/api/types.ProvisionToken].
+	ProvisionTokenCreateCode = "TJT00I"
 
 	// GithubConnectorCreatedCode is the Github connector created event code.
 	GithubConnectorCreatedCode = "T8000I"
 	// GithubConnectorDeletedCode is the Github connector deleted event code.
 	GithubConnectorDeletedCode = "T8001I"
+	// GithubConnectorUpdatedCode is the Github connector updated event code.
+	GithubConnectorUpdatedCode = "T80002I"
 
 	// OIDCConnectorCreatedCode is the OIDC connector created event code.
 	OIDCConnectorCreatedCode = "T8100I"
 	// OIDCConnectorDeletedCode is the OIDC connector deleted event code.
 	OIDCConnectorDeletedCode = "T8101I"
+	// OIDCConnectorUpdatedCode is the OIDC connector updated event code.
+	OIDCConnectorUpdatedCode = "T8102I"
 
 	// SAMLConnectorCreatedCode is the SAML connector created event code.
 	SAMLConnectorCreatedCode = "T8200I"
 	// SAMLConnectorDeletedCode is the SAML connector deleted event code.
 	SAMLConnectorDeletedCode = "T8201I"
+	// SAMLConnectorUpdatedCode is the SAML connector updated event code.
+	SAMLConnectorUpdatedCode = "T8202I"
 
 	// RoleCreatedCode is the role created event code.
 	RoleCreatedCode = "T9000I"
 	// RoleDeletedCode is the role deleted event code.
 	RoleDeletedCode = "T9001I"
+	// RoleUpdatedCode is the role created event code.
+	RoleUpdatedCode = "T9002I"
 
 	// BotJoinCode is the 'bot.join' event code.
 	BotJoinCode = "TJ001I"
 	// InstanceJoinCode is the 'node.join' event code.
 	InstanceJoinCode = "TJ002I"
+
+	// BotCreateCode is the `bot.create` event code.
+	BotCreateCode = "TB001I"
+	// BotUpdateCode is the `bot.update` event code.
+	BotUpdateCode = "TB002I"
+	// BotDeleteCode is the `bot.delete` event code.
+	BotDeleteCode = "TB003I"
 
 	// LockCreatedCode is the lock created event code.
 	LockCreatedCode = "TLK00I"
@@ -409,6 +464,8 @@ const (
 	DeviceAuthenticateCode = "TV006I"
 	// DeviceUpdateCode is the device update code.
 	DeviceUpdateCode = "TV007I"
+	// DeviceWebTokenCreateCode is the device web token creation code.
+	DeviceWebTokenCreateCode = "TV008I"
 
 	// LoginRuleCreateCode is the login rule create code.
 	LoginRuleCreateCode = "TLR00I"
@@ -441,6 +498,110 @@ const (
 
 	// SAMLIdPServiceProviderDeleteAllFailureCode is the SAML IdP service provider delete all failure code.
 	SAMLIdPServiceProviderDeleteAllFailureCode = "TSI004W"
+
+	// OktaGroupsUpdateCode is the Okta groups updated code.
+	OktaGroupsUpdateCode = "TOK001I"
+
+	// OktaApplicationsUpdateCode is the Okta applications updated code.
+	OktaApplicationsUpdateCode = "TOK002I"
+
+	// OktaSyncFailureCode is the Okta synchronization failure code.
+	OktaSyncFailureCode = "TOK003E"
+
+	// OktaAssignmentProcessSuccessCode is the Okta assignment process success code.
+	OktaAssignmentProcessSuccessCode = "TOK004I"
+
+	// OktaAssignmentProcessFailureCode is the Okta assignment process failure code.
+	OktaAssignmentProcessFailureCode = "TOK004E"
+
+	// OktaAssignmentCleanupSuccessCode is the Okta assignment cleanup success code.
+	OktaAssignmentCleanupSuccessCode = "TOK005I"
+
+	// OktaAssignmentCleanupFailureCode is the Okta assignment cleanup failure code.
+	OktaAssignmentCleanupFailureCode = "TOK005E"
+
+	// OktaAccessListSyncSuccessCode is the Okta access list sync success code.
+	OktaAccessListSyncSuccessCode = "TOK006I"
+
+	// OktaAccessListSyncSuccessCode is the Okta access list sync failure code.
+	OktaAccessListSyncFailureCode = "TOK006E"
+
+	// OktaUserSyncSuccessCode is the Okta user sync success code.
+	OktaUserSyncSuccessCode = "TOK007I"
+
+	// OktaUserSyncSuccessCode is the Okta user sync failure code.
+	OktaUserSyncFailureCode = "TOK007E"
+
+	// AccessListCreateSuccessCode is the access list create success code.
+	AccessListCreateSuccessCode = "TAL001I"
+
+	// AccessListCreateFailureCode is the access list create failure code.
+	AccessListCreateFailureCode = "TAL001E"
+
+	// AccessListUpdateSuccessCode is the access list update success code.
+	AccessListUpdateSuccessCode = "TAL002I"
+
+	// AccessListUpdateFailureCode is the access list update failure code.
+	AccessListUpdateFailureCode = "TAL002E"
+
+	// AccessListDeleteSuccessCode is the access list delete success code.
+	AccessListDeleteSuccessCode = "TAL003I"
+
+	// AccessListDeleteFailureCode is the access list delete failure code.
+	AccessListDeleteFailureCode = "TAL003E"
+
+	// AccessListReviewSuccessCode is the access list review success code.
+	AccessListReviewSuccessCode = "TAL004I"
+
+	// AccessListReviewFailureCode is the access list review failure code.
+	AccessListReviewFailureCode = "TAL004E"
+
+	// AccessListMemberCreateSuccessCode is the access list member create success code.
+	AccessListMemberCreateSuccessCode = "TAL005I"
+
+	// AccessListMemberCreateFailureCode is the access list member create failure code.
+	AccessListMemberCreateFailureCode = "TAL005E"
+
+	// AccessListMemberUpdateSuccessCode is the access list member update success code.
+	AccessListMemberUpdateSuccessCode = "TAL006I"
+
+	// AccessListMemberUpdateFailureCode is the access list member update failure code.
+	AccessListMemberUpdateFailureCode = "TAL006E"
+
+	// AccessListMemberDeleteSuccessCode is the access list member delete success code.
+	AccessListMemberDeleteSuccessCode = "TAL007I"
+
+	// AccessListMemberDeleteFailureCode is the access list member delete failure code.
+	AccessListMemberDeleteFailureCode = "TAL007E"
+
+	// AccessListMemberDeleteAllForAccessListSuccessCode is the access list all member delete success code.
+	AccessListMemberDeleteAllForAccessListSuccessCode = "TAL008I"
+
+	// AccessListMemberDeleteAllForAccessListFailureCode is the access list member delete failure code.
+	AccessListMemberDeleteAllForAccessListFailureCode = "TAL008E"
+
+	// SecReportsAuditQueryRunCode is used when a custom Security Reports Query is run.
+	SecReportsAuditQueryRunCode = "SRE001I"
+
+	// SecReportsReportRunCode is used when a report in run.
+	SecReportsReportRunCode = "SRE002I"
+
+	// ExternalAuditStorageEnableCode is the External Audit Storage enabled code.
+	ExternalAuditStorageEnableCode = "TEA001I"
+	// ExternalAuditStorageDisableCode is the External Audit Storage disabled code.
+	ExternalAuditStorageDisableCode = "TEA002I"
+
+	// SPIFFESVIDIssuedSuccessCode is the SPIFFE SVID issued success code.
+	SPIFFESVIDIssuedSuccessCode = "TSPIFFE000I"
+	// SPIFFESVIDIssuedFailureCode is the SPIFFE SVID issued failure code.
+	SPIFFESVIDIssuedFailureCode = "TSPIFFE000E"
+
+	// AuthPreferenceUpdateCode is the auth preference updated event code.
+	AuthPreferenceUpdateCode = "TCAUTH001I"
+	// ClusterNetworkingConfigUpdateCode is the cluster networking config updated event code.
+	ClusterNetworkingConfigUpdateCode = "TCNET002I"
+	// SessionRecordingConfigUpdateCode is the session recording config updated event code.
+	SessionRecordingConfigUpdateCode = "TCREC003I"
 
 	// UnknownCode is used when an event of unknown type is encountered.
 	UnknownCode = apievents.UnknownCode

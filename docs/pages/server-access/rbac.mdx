@@ -14,14 +14,6 @@ emergency.*
 For a more general description of Teleport roles and examples see our [Access Controls guides](../access-controls/introduction.mdx), as
 this section focuses on configuring RBAC for servers connected to Teleport.
 
-<Notice type="tip">
-
-Teleport's RBAC system does not extend to OpenSSH servers, as it is not possible
-to apply labels to servers running `sshd`. You must enable access to these
-servers via the Teleport SSH Service instead.
-
-</Notice>
-
 ## Role configuration
 
 Teleport's "role" resource provides the following instruments for restricting
@@ -48,7 +40,7 @@ spec:
       # a list of allowed values:
       'region': ['us-west-1', 'eu-central-1']
       # regular expressions start with ^ and end with $
-      # Teleport uses Golang's regexp syntax.
+      # Teleport uses Go's regexp syntax (https://github.com/google/re2/wiki/Syntax)
       # the list example above can be expressed as:
       'reg': '^us-west-1|eu-central-1$'
 
@@ -82,7 +74,7 @@ providers. For OIDC logins, `{{external.xyz}}` refers to the "xyz" claim; for
 SAML logins, `{{external.xyz}}` refers to the "xyz" assertion.
 
 For example, here is what a role may look like if you want to assign allowed
-server environment types and allowed logins from the user's Okta `environments` and 
+server environment types and allowed logins from the user's Okta `environments` and
 `allowedlogins` assertions:
 
 ```yaml
@@ -95,8 +87,8 @@ spec:
 ```
 
 The `{{internal.logins}}` variable applies to local users
-and works with Teleport Trusted Clusters. Trusted Clusters allow
-connecting via a root Teleport cluster to resources connected to other Teleport clusters.
+and works with Teleport trusted clusters. Trusted clusters allow
+connecting from a root Teleport cluster to resources connected to other Teleport clusters.
 Those Teleport clusters, identified as leaf clusters, allow the connection
 by trusting the root Teleport cluster.
 
@@ -120,6 +112,10 @@ spec:
     logins: ["{{internal.logins}}"]
 ```
 
+For full details on how variable expansion works in Teleport roles, see the
+[Teleport Access Controls
+Reference](../access-controls/reference.mdx).
+
 ## Server role options
 
 The `allow` and `deny` sections described above are used for controlling
@@ -132,7 +128,9 @@ spec:
     #....
   options:
     # Controls whether this role supports auto provisioning of users.
-    create_host_user: true
+    # Options: keep (keep users at session end), insecure-drop (remove user on session end),
+    #          and off (disable host user creation)
+    create_host_user_mode: keep
     # forward_agent controls whether SSH agent forwarding is allowed
     forward_agent: true
     # port_forwarding controls whether TCP port forwarding is allowed for SSH
@@ -173,13 +171,15 @@ spec:
       # Optional: the default session recording mode to use when a
       # protocol-specific mode is not set.
       default: best_effort|strict
-      # Optional: Session recording mode for SSH sessions. 
+      # Optional: Session recording mode for SSH sessions.
       # If not set, the value set on default will be used.
       ssh: best_effort|strict
+    # Require an additional MFA tap to start new sessions.
+    # Optional: the default is false.
+    require_session_mfa: true
     # Enterprise-only: when enabled, the source IP that was used to log in is embedded in the user
     # certificates, preventing a compromised certificate from being used on another
     # network. The default is false.
-    # Note: Source IP pinning is currently in Preview mode.
     pin_source_ip: true
     # Specify a list of names and associated values to be included in user SSH keys.
     # The key type can only be "ssh" and the mode can only be "extension".

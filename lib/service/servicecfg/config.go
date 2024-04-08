@@ -1,31 +1,39 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
-// package servicecfg contains the runtime configuration for Teleport services
+// Package servicecfg contains the runtime configuration for Teleport services
 package servicecfg
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ghodss/yaml"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/sashabaranov/go-openai"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
@@ -43,6 +51,7 @@ import (
 	"github.com/gravitational/teleport/lib/sshca"
 	usagereporter "github.com/gravitational/teleport/lib/usagereporter/teleport"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 // Config contains the configuration for all services that Teleport can run.
@@ -103,8 +112,14 @@ type Config struct {
 	// Discovery defines the discovery service configuration.
 	Discovery DiscoveryConfig
 
+	// OpenSSH defines the configuration for an openssh node
+	OpenSSH OpenSSHConfig
+
 	// Okta defines the okta service configuration.
 	Okta OktaConfig
+
+	// Jamf defines the Jamf MDM service configuration.
+	Jamf JamfConfig
 
 	// Tracing defines the tracing service configuration.
 	Tracing TracingConfig
@@ -129,7 +144,7 @@ type Config struct {
 	// PidFile is a full path of the PID file for teleport daemon
 	PIDFile string
 
-	// Trust is a service that manages users and credentials
+	// Trust is a service that manages certificate authorities
 	Trust services.Trust
 
 	// Presence service is a discovery and heartbeat tracker
@@ -141,7 +156,7 @@ type Config struct {
 	// Provisioner is a service that keeps track of provisioning tokens
 	Provisioner services.Provisioner
 
-	// Trust is a service that manages users and credentials
+	// Identity is a service that manages users and credentials
 	Identity services.Identity
 
 	// Access is a service that controls access
@@ -175,33 +190,19 @@ type Config struct {
 	// endpoint extended with additional /debug handlers
 	Debug bool
 
-	// UploadEventsC is a channel for upload events
-	// used in tests
-	UploadEventsC chan events.UploadEvent `json:"-"`
-
 	// FileDescriptors is an optional list of file descriptors for the process
 	// to inherit and use for listeners, used for in-process updates.
-	FileDescriptors []FileDescriptor
+	FileDescriptors []*FileDescriptor
 
 	// PollingPeriod is set to override default internal polling periods
 	// of sync agents, used to speed up integration tests.
 	PollingPeriod time.Duration
-
-	// ClientTimeout is set to override default client timeouts
-	// used by internal clients, used to speed up integration tests.
-	ClientTimeout time.Duration
-
-	// ShutdownTimeout is set to override default shutdown timeout.
-	ShutdownTimeout time.Duration
 
 	// CAPins are the SKPI hashes of the CAs used to verify the Auth Server.
 	CAPins []string
 
 	// Clock is used to control time in tests.
 	Clock clockwork.Clock
-
-	// TeleportVersion is used to control the Teleport version in tests.
-	TeleportVersion string
 
 	// FIPS means FedRAMP/FIPS 140-2 compliant configuration was requested.
 	FIPS bool
@@ -216,8 +217,14 @@ type Config struct {
 	// Kube is a Kubernetes API gateway using Teleport client identities.
 	Kube KubeConfig
 
-	// Log optionally specifies the logger
+	// Log optionally specifies the logger.
+	// Deprecated: use Logger instead.
 	Log utils.Logger
+	// Logger outputs messages using slog. The underlying handler respects
+	// the user supplied logging config.
+	Logger *slog.Logger
+	// LoggerLevel defines the Logger log level.
+	LoggerLevel *slog.LevelVar
 
 	// PluginRegistry allows adding enterprise logic to Teleport services
 	PluginRegistry plugin.Registry
@@ -228,9 +235,6 @@ type Config struct {
 
 	// MaxRetryPeriod is the maximum period between reconnection attempts to auth
 	MaxRetryPeriod time.Duration
-
-	// ConnectFailureC is a channel to notify of failures to connect to auth (used in tests).
-	ConnectFailureC chan time.Duration
 
 	// TeleportHome is the path to tsh configuration and data, used
 	// for loading profiles when TELEPORT_HOME is set
@@ -247,6 +251,12 @@ type Config struct {
 
 	// InstanceMetadataClient specifies the instance metadata client.
 	InstanceMetadataClient cloud.InstanceMetadata
+
+	// Testing is a group of properties that are used in tests.
+	Testing ConfigTesting
+
+	// AccessGraph represents AccessGraph server config
+	AccessGraph AccessGraphConfig
 
 	// token is either the token needed to join the auth server, or a path pointing to a file
 	// that contains the token
@@ -270,6 +280,53 @@ type Config struct {
 	authServers []utils.NetAddr
 }
 
+type ConfigTesting struct {
+	// ConnectFailureC is a channel to notify of failures to connect to auth (used in tests).
+	ConnectFailureC chan time.Duration
+
+	// UploadEventsC is a channel for upload events used in tests
+	UploadEventsC chan events.UploadEvent `json:"-"`
+
+	// ClientTimeout is set to override default client timeouts
+	// used by internal clients, used to speed up integration tests.
+	ClientTimeout time.Duration
+
+	// ShutdownTimeout is set to override default shutdown timeout.
+	ShutdownTimeout time.Duration
+
+	// TeleportVersion is used to control the Teleport version in tests.
+	TeleportVersion string
+
+	// KubeMultiplexerIgnoreSelfConnections signals that Proxy TLS server's listener should
+	// require PROXY header if 'proxyProtocolMode: true' even from self connections. Used in tests as all connections are self
+	// connections there.
+	KubeMultiplexerIgnoreSelfConnections bool
+
+	// OpenAIConfig contains the optional OpenAI client configuration used by
+	// auth and proxy. When it's not set (the default, we don't offer a way to
+	// set it when executing the regular Teleport binary) we use the default
+	// configuration with auth tokens passed from Auth.AssistAPIKey or
+	// Proxy.AssistAPIKey. We set this only when testing to avoid calls to reach
+	// the real OpenAI API.
+	// Note: When set, this overrides Auth and Proxy's AssistAPIKey settings.
+	OpenAIConfig *openai.ClientConfig
+}
+
+// AccessGraphConfig represents TAG server config
+type AccessGraphConfig struct {
+	// Enabled Access Graph reporting enabled
+	Enabled bool
+
+	// Addr of the Access Graph service addr
+	Addr string
+
+	// CA is the path to the CA certificate file
+	CA string
+
+	// Insecure is true if the connection to the Access Graph service should be insecure
+	Insecure bool
+}
+
 // RoleAndIdentityEvent is a role and its corresponding identity event.
 type RoleAndIdentityEvent struct {
 	// Role is a system role.
@@ -277,6 +334,18 @@ type RoleAndIdentityEvent struct {
 
 	// IdentityEvent is the identity event associated with the above role.
 	IdentityEvent string
+}
+
+// DisableLongRunningServices disables all services but OpenSSH
+func DisableLongRunningServices(cfg *Config) {
+	cfg.Auth.Enabled = false
+	cfg.Proxy.Enabled = false
+	cfg.SSH.Enabled = false
+	cfg.Kube.Enabled = false
+	cfg.Apps.Enabled = false
+	cfg.WindowsDesktop.Enabled = false
+	cfg.Databases.Enabled = false
+	cfg.Okta.Enabled = false
 }
 
 // JoinParams is a set of extra parameters for joining the auth server.
@@ -446,6 +515,14 @@ func ApplyDefaults(cfg *Config) {
 		cfg.Log = utils.NewLogger()
 	}
 
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
+	if cfg.LoggerLevel == nil {
+		cfg.LoggerLevel = new(slog.LevelVar)
+	}
+
 	// Remove insecure and (borderline insecure) cryptographic primitives from
 	// default configuration. These can still be added back in file configuration by
 	// users, but not supported by default by Teleport. See #1856 for more
@@ -460,7 +537,7 @@ func ApplyDefaults(cfg *Config) {
 	hostname, err := os.Hostname()
 	if err != nil {
 		hostname = "localhost"
-		cfg.Log.Errorf("Failed to determine hostname: %v.", err)
+		cfg.Logger.ErrorContext(context.Background(), "Failed to determine hostname", "error", err)
 	}
 
 	// Global defaults.
@@ -483,7 +560,6 @@ func ApplyDefaults(cfg *Config) {
 	cfg.Auth.SessionRecordingConfig = types.DefaultSessionRecordingConfig()
 	cfg.Auth.Preference = types.DefaultAuthPreference()
 	defaults.ConfigureLimiter(&cfg.Auth.Limiter)
-	cfg.Auth.LicenseFile = filepath.Join(cfg.DataDir, defaults.LicenseFile)
 
 	cfg.Proxy.WebAddr = *defaults.ProxyWebListenAddr()
 	// Proxy service defaults.
@@ -499,7 +575,6 @@ func ApplyDefaults(cfg *Config) {
 	defaults.ConfigureLimiter(&cfg.SSH.Limiter)
 	cfg.SSH.PAM = &PAMConfig{Enabled: false}
 	cfg.SSH.BPF = &BPFConfig{Enabled: false}
-	cfg.SSH.RestrictedSession = &RestrictedSessionConfig{Enabled: false}
 	cfg.SSH.AllowTCPForwarding = true
 	cfg.SSH.AllowFileCopying = true
 
@@ -523,13 +598,15 @@ func ApplyDefaults(cfg *Config) {
 
 	cfg.RotationConnectionInterval = defaults.HighResPollingPeriod
 	cfg.MaxRetryPeriod = defaults.MaxWatcherBackoff
-	cfg.ConnectFailureC = make(chan time.Duration, 1)
+	cfg.Testing.ConnectFailureC = make(chan time.Duration, 1)
 	cfg.CircuitBreakerConfig = breaker.DefaultBreakerConfig(cfg.Clock)
 }
 
 // FileDescriptor is a file descriptor associated
 // with a listener
 type FileDescriptor struct {
+	once sync.Once
+
 	// Type is a listener type, e.g. auth:ssh
 	Type string
 	// Address is an address of the listener, e.g. 127.0.0.1:3025
@@ -538,12 +615,22 @@ type FileDescriptor struct {
 	File *os.File
 }
 
+func (fd *FileDescriptor) Close() error {
+	var err error
+	fd.once.Do(func() {
+		err = fd.File.Close()
+	})
+	return trace.Wrap(err)
+}
+
 func (fd *FileDescriptor) ToListener() (net.Listener, error) {
 	listener, err := net.FileListener(fd.File)
 	if err != nil {
 		return nil, err
 	}
-	fd.File.Close()
+	if err := fd.Close(); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	return listener, nil
 }
 
@@ -596,6 +683,14 @@ func applyDefaults(cfg *Config) {
 		cfg.Log = logrus.StandardLogger()
 	}
 
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+
+	if cfg.LoggerLevel == nil {
+		cfg.LoggerLevel = new(slog.LevelVar)
+	}
+
 	if cfg.PollingPeriod == 0 {
 		cfg.PollingPeriod = defaults.LowResPollingPeriod
 	}
@@ -627,7 +722,7 @@ func validateAuthOrProxyServices(cfg *Config) error {
 		if haveProxyServer {
 			port := cfg.ProxyServer.Port(0)
 			if port == defaults.AuthListenPort {
-				cfg.Log.Warnf("config: proxy_server is pointing to port %d, is this the auth server address?", defaults.AuthListenPort)
+				cfg.Logger.WarnContext(context.Background(), "config: proxy_server is pointing to port 3025, is this the auth server address?")
 			}
 		}
 
@@ -636,7 +731,7 @@ func validateAuthOrProxyServices(cfg *Config) error {
 			checkPorts := []int{defaults.HTTPListenPort, teleport.StandardHTTPSPort}
 			for _, port := range checkPorts {
 				if authServerPort == port {
-					cfg.Log.Warnf("config: auth_server is pointing to port %d, is this the proxy server address?", port)
+					cfg.Logger.WarnContext(context.Background(), "config: auth_server is pointing to port 3080 or 443, is this the proxy server address?")
 				}
 			}
 		}
@@ -666,6 +761,8 @@ func verifyEnabledService(cfg *Config) error {
 		cfg.WindowsDesktop.Enabled,
 		cfg.Discovery.Enabled,
 		cfg.Okta.Enabled,
+		cfg.Jamf.Enabled(),
+		cfg.OpenSSH.Enabled,
 	}
 
 	for _, item := range enabled {
@@ -675,5 +772,14 @@ func verifyEnabledService(cfg *Config) error {
 	}
 
 	return trace.BadParameter(
-		"config: enable at least one of auth_service, ssh_service, proxy_service, app_service, database_service, kubernetes_service, windows_desktop_service, discovery_service, or okta_service")
+		"config: enable at least one of auth_service, ssh_service, proxy_service, app_service, database_service, kubernetes_service, windows_desktop_service, discovery_service, okta_service or jamf_service")
+}
+
+// SetLogLevel changes the loggers log level.
+//
+// If called after `config.ApplyFileConfig` or `config.Configure` it will also
+// change the global loggers.
+func (c *Config) SetLogLevel(level slog.Level) {
+	c.Log.SetLevel(logutils.SlogLevelToLogrusLevel(level))
+	c.LoggerLevel.Set(level)
 }

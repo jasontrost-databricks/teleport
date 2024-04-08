@@ -143,6 +143,10 @@ func (kind WatchKind) Matches(e Event) (bool, error) {
 			var filter CertAuthorityFilter
 			filter.FromMap(kind.Filter)
 			return filter.Match(res), nil
+		case *HeadlessAuthentication:
+			var filter HeadlessAuthenticationFilter
+			filter.FromMap(kind.Filter)
+			return filter.Match(res), nil
 		default:
 			// we don't know about this filter, let the event through
 		}
@@ -170,6 +174,13 @@ func (kind WatchKind) Contains(subset WatchKind) bool {
 
 	if !kind.LoadSecrets && subset.LoadSecrets {
 		return false
+	}
+
+	if kind.Kind == KindCertAuthority {
+		var a, b CertAuthorityFilter
+		a.FromMap(kind.Filter)
+		b.FromMap(subset.Filter)
+		return a.Contains(b)
 	}
 
 	for k, v := range kind.Filter {

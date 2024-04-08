@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package mysql
 
@@ -20,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -32,7 +35,6 @@ import (
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils/retryutils"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/cloud"
 	"github.com/gravitational/teleport/lib/srv/db/common"
@@ -81,14 +83,30 @@ func (e *Engine) SendError(err error) {
 // middleman between the proxy and the database intercepting and interpreting
 // all messages i.e. doing protocol parsing.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
+
 	// Perform authorization checks.
 	err := e.checkAccess(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	// Automatically create the database user if needed.
+	cancelAutoUserLease, err := e.GetUserProvisioner(e).Activate(ctx, sessionCtx)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	defer func() {
+		err := e.GetUserProvisioner(e).Teardown(ctx, sessionCtx)
+		if err != nil {
+			e.Log.WithError(err).Error("Failed to teardown the user.")
+		}
+	}()
+
 	// Establish connection to the MySQL server.
 	serverConn, err := e.connect(ctx, sessionCtx)
 	if err != nil {
+		defer cancelAutoUserLease()
 		if trace.IsLimitExceeded(err) {
 			return trace.LimitExceeded("could not connect to the database, please try again later")
 		}
@@ -101,11 +119,15 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 		}
 	}()
 
+	// Release the auto-users semaphore now that we've successfully connected.
+	cancelAutoUserLease()
+
 	// Internally, updateServerVersion() updates databases only when database version
 	// is not set, or it has changed since previous call.
 	if err := e.updateServerVersion(sessionCtx, serverConn); err != nil {
 		// Log but do not fail connection if the version update fails.
 		e.Log.WithError(err).Warnf("Failed to update the MySQL server version.")
+
 	}
 
 	// Send back OK packet to indicate auth/connect success. At this point
@@ -114,13 +136,17 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
 	e.Audit.OnSessionStart(e.Context, sessionCtx, nil)
 	defer e.Audit.OnSessionEnd(e.Context, sessionCtx)
+
+	observe()
+
 	// Copy between the connections.
 	clientErrCh := make(chan error, 1)
 	serverErrCh := make(chan error, 1)
 	go e.receiveFromClient(e.proxyConn.Conn, serverConn, clientErrCh, sessionCtx)
-	go e.receiveFromServer(serverConn, e.proxyConn.Conn, serverErrCh)
+	go e.receiveFromServer(serverConn, e.proxyConn.Conn, serverErrCh, sessionCtx)
 	select {
 	case err := <-clientErrCh:
 		e.Log.WithError(err).Debug("Client done.")
@@ -137,27 +163,46 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 func (e *Engine) updateServerVersion(sessionCtx *common.Session, serverConn *client.Conn) error {
 	serverVersion := serverConn.GetServerVersion()
 	statusVersion := sessionCtx.Database.GetMySQLServerVersion()
-	// Update only when needed
-	if serverVersion != "" && serverVersion != statusVersion {
-		sessionCtx.Database.SetMySQLServerVersion(serverVersion)
+
+	// Update only when needed.
+	if serverVersion == "" || serverVersion == statusVersion {
+		return nil
 	}
 
+	// Note that sessionCtx.Database is a copy of the database cached by
+	// database service. Call e.UpdateProxiedDatabase to do the update instead of
+	// setting the copy.
+	doUpdate := func(db types.Database) error {
+		db.SetMySQLServerVersion(serverVersion)
+		return nil
+	}
+
+	if err := e.UpdateProxiedDatabase(sessionCtx.Database.GetName(), doUpdate); err != nil {
+		return trace.Wrap(err)
+	}
+
+	e.Log.WithField("server-version", serverVersion).Debug("Updated MySQL server version.")
 	return nil
 }
 
 // checkAccess does authorization check for MySQL connection about to be established.
 func (e *Engine) checkAccess(ctx context.Context, sessionCtx *common.Session) error {
+	if err := sessionCtx.CheckUsernameForAutoUserProvisioning(); err != nil {
+		return trace.Wrap(err)
+	}
+
 	authPref, err := e.Auth.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
 
 	state := sessionCtx.GetAccessState(authPref)
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		sessionCtx.Database,
-		sessionCtx.DatabaseUser,
-		sessionCtx.DatabaseName,
-	)
+	dbRoleMatchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:       sessionCtx.Database,
+		DatabaseUser:   sessionCtx.DatabaseUser,
+		DatabaseName:   sessionCtx.DatabaseName,
+		AutoCreateUser: sessionCtx.AutoCreateUserMode.IsEnabled(),
+	})
 	err = sessionCtx.Checker.CheckAccess(
 		sessionCtx.Database,
 		state,
@@ -190,34 +235,17 @@ func (e *Engine) connect(ctx context.Context, sessionCtx *common.Session) (*clie
 			return nil, trace.Wrap(err)
 		}
 	case sessionCtx.Database.IsCloudSQL():
-		// For Cloud SQL MySQL there is no IAM auth, so we use one-time passwords
-		// by resetting the database user password for each connection. Thus,
-		// acquire a lock to make sure all connection attempts to the same
-		// database and user are serialized.
-		retryCtx, cancel := context.WithTimeout(ctx, defaults.DatabaseConnectTimeout)
-		defer cancel()
-		lease, err := services.AcquireSemaphoreWithRetry(retryCtx, e.makeAcquireSemaphoreConfig(sessionCtx))
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
-		// Only release the semaphore after the connection has been established
-		// below. If the semaphore fails to release for some reason, it will
-		// expire in a minute on its own.
-		defer func() {
-			err := e.AuthClient.CancelSemaphoreLease(ctx, *lease)
-			if err != nil {
-				e.Log.WithError(err).Errorf("Failed to cancel lease: %v.", lease)
-			}
-		}()
-		password, err = e.Auth.GetCloudSQLPassword(ctx, sessionCtx)
-		if err != nil {
-			return nil, trace.Wrap(err)
-		}
 		// Get the client once for subsequent calls (it acquires a read lock).
 		gcpClient, err := e.CloudClients.GetGCPSQLAdminClient(ctx)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+
+		user, password, err = e.getGCPUserAndPassword(ctx, sessionCtx, gcpClient)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+
 		// Detect whether the instance is set to require SSL.
 		// Fallback to not requiring SSL for access denied errors.
 		requireSSL, err := cloud.GetGCPRequireSSL(ctx, sessionCtx, gcpClient)
@@ -289,6 +317,9 @@ func (e *Engine) receiveFromClient(clientConn, serverConn net.Conn, clientErrCh 
 		log.Debug("Stop receiving from client.")
 		close(clientErrCh)
 	}()
+
+	msgFromClient := common.GetMessagesFromClientMetric(sessionCtx.Database)
+
 	for {
 		packet, err := protocol.ParsePacket(clientConn)
 		if err != nil {
@@ -300,6 +331,9 @@ func (e *Engine) receiveFromClient(clientConn, serverConn net.Conn, clientErrCh 
 			clientErrCh <- err
 			return
 		}
+
+		msgFromClient.Inc()
+
 		switch pkt := packet.(type) {
 		case *protocol.Query:
 			e.Audit.OnQuery(e.Context, sessionCtx, common.Query{Query: pkt.Query()})
@@ -318,6 +352,12 @@ func (e *Engine) receiveFromClient(clientConn, serverConn net.Conn, clientErrCh 
 			return
 
 		case *protocol.InitDB:
+			// Update DatabaseName when switching to another so the audit logs
+			// are up to date. E.g.:
+			// mysql> use foo;
+			// mysql> select * from users;
+			sessionCtx.DatabaseName = pkt.SchemaName()
+
 			e.Audit.EmitEvent(e.Context, makeInitDBEvent(sessionCtx, pkt))
 		case *protocol.CreateDB:
 			e.Audit.EmitEvent(e.Context, makeCreateDBEvent(sessionCtx, pkt))
@@ -365,34 +405,52 @@ func (e *Engine) receiveFromClient(clientConn, serverConn net.Conn, clientErrCh 
 
 // receiveFromServer relays protocol messages received from MySQL database
 // to MySQL client.
-func (e *Engine) receiveFromServer(serverConn, clientConn net.Conn, serverErrCh chan<- error) {
+func (e *Engine) receiveFromServer(serverConn, clientConn net.Conn, serverErrCh chan<- error, sessionCtx *common.Session) {
 	log := e.Log.WithFields(logrus.Fields{
 		"from":   "server",
 		"client": clientConn.RemoteAddr(),
 		"server": serverConn.RemoteAddr(),
 	})
-	defer func() {
-		log.Debug("Stop receiving from server.")
-		close(serverErrCh)
-	}()
-	for {
-		packet, _, err := protocol.ReadPacket(serverConn)
-		if err != nil {
-			if utils.IsOKNetworkError(err) {
-				log.Debug("Server connection closed.")
+	messagesCounter := common.GetMessagesFromServerMetric(sessionCtx.Database)
+
+	// parse and count the messages from the server in a separate goroutine,
+	// operating on a copy of the server message stream. the copy is arranged below.
+	copyReader, copyWriter := io.Pipe()
+	defer copyWriter.Close()
+
+	go func() {
+		defer copyReader.Close()
+
+		var count int64
+		defer func() {
+			log.WithField("parsed_total", count).Debug("Stopped parsing messages from server.")
+		}()
+
+		for {
+			_, _, err := protocol.ReadPacket(copyReader)
+			if err != nil {
 				return
 			}
-			log.WithError(err).Error("Failed to read server packet.")
-			serverErrCh <- err
-			return
+
+			count += 1
+			messagesCounter.Inc()
 		}
-		_, err = protocol.WritePacket(packet, clientConn)
-		if err != nil {
-			log.WithError(err).Error("Failed to write client packet.")
-			serverErrCh <- err
-			return
+	}()
+
+	// the messages are ultimately copied from serverConn to clientConn,
+	// but a copy of that message stream is written to a synchronous pipe,
+	// which is read by the analysis goroutine above.
+	total, err := io.Copy(clientConn, io.TeeReader(serverConn, copyWriter))
+	if err != nil {
+		if utils.IsOKNetworkError(err) {
+			log.Debug("Server connection closed.")
+		} else {
+			log.WithError(err).Warn("Server -> Client copy finished with unexpected error.")
 		}
 	}
+
+	log.Debugf("Stopped receiving from server. Transferred %v bytes.", total)
+	serverErrCh <- trace.Wrap(err)
 }
 
 // makeAcquireSemaphoreConfig builds parameters for acquiring a semaphore

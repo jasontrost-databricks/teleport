@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,7 +34,6 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	oteltrace "go.opentelemetry.io/otel/trace"
 	"golang.org/x/net/http/httpproxy"
 
@@ -41,6 +41,7 @@ import (
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/observability/tracing"
 	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/utils"
 	"github.com/gravitational/teleport/api/utils/keys"
 )
@@ -125,7 +126,8 @@ func doWithFallback(clt *http.Client, allowPlainHTTP bool, extraHeaders map[stri
 		req.Header.Add(k, v)
 	}
 
-	log.Debugf("Attempting %s %s%s", req.Method, req.URL.Host, req.URL.Path)
+	logger := slog.With("method", req.Method, "host", req.URL.Host, "path", req.URL.Path)
+	logger.DebugContext(req.Context(), "Attempting request to Proxy web api")
 	span.AddEvent("sending https request")
 	resp, err := clt.Do(req)
 
@@ -144,7 +146,7 @@ func doWithFallback(clt *http.Client, allowPlainHTTP bool, extraHeaders map[stri
 	// If we get to here a) the HTTPS attempt failed, and b) we're allowed to try
 	// clear-text HTTP to see if that works.
 	req.URL.Scheme = "http"
-	log.Warnf("Request for %s %s%s falling back to PLAIN HTTP", req.Method, req.URL.Host, req.URL.Path)
+	logger.WarnContext(req.Context(), "HTTPS request failed, falling back to HTTP")
 	span.AddEvent("falling back to http request")
 	resp, err = clt.Do(req)
 	if err != nil {
@@ -313,6 +315,8 @@ type ProxySettings struct {
 	// TLSRoutingEnabled indicates that proxy supports ALPN SNI server where
 	// all proxy services are exposed on a single TLS listener (Proxy Web Listener).
 	TLSRoutingEnabled bool `json:"tls_routing_enabled"`
+	// AssistEnabled is true when Teleport Assist is enabled.
+	AssistEnabled bool `json:"assist_enabled"`
 }
 
 // KubeProxySettings is kubernetes proxy settings
@@ -394,11 +398,8 @@ type AuthenticationSettings struct {
 	Github *GithubSettings `json:"github,omitempty"`
 	// PrivateKeyPolicy contains the cluster-wide private key policy.
 	PrivateKeyPolicy keys.PrivateKeyPolicy `json:"private_key_policy"`
-	// DeviceTrustDisabled provides a clue to Teleport clients on whether to avoid
-	// device authentication.
-	// Deprecated: Use DeviceTrust.Disabled instead.
-	// DELETE IN 16.0, replaced by the DeviceTrust field (codingllama).
-	DeviceTrustDisabled bool `json:"device_trust_disabled,omitempty"`
+	// PIVSlot specifies a specific PIV slot to use with hardware key support.
+	PIVSlot keys.PIVSlot `json:"piv_slot"`
 	// DeviceTrust holds cluster-wide device trust settings.
 	DeviceTrust DeviceTrustSettings `json:"device_trust,omitempty"`
 	// HasMessageOfTheDay is a flag indicating that the cluster has MOTD
@@ -407,6 +408,9 @@ type AuthenticationSettings struct {
 	HasMessageOfTheDay bool `json:"has_motd"`
 	// LoadAllCAs tells tsh to load CAs for all clusters when trying to ssh into a node.
 	LoadAllCAs bool `json:"load_all_cas,omitempty"`
+	// DefaultSessionTTL is the TTL requested for user certs if
+	// a TTL is not otherwise specified.
+	DefaultSessionTTL types.Duration `json:"default_session_ttl"`
 }
 
 // LocalSettings holds settings for local authentication.

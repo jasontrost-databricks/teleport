@@ -1,24 +1,27 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package multiplexer
 
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"net"
 	"time"
@@ -71,7 +74,7 @@ func NewTLSListener(cfg TLSListenerConfig) (*TLSListener, error) {
 	context, cancel := context.WithCancel(context.TODO())
 	return &TLSListener{
 		log: log.WithFields(log.Fields{
-			trace.Component: teleport.Component("mxtls", cfg.ID),
+			teleport.ComponentKey: teleport.Component("mxtls", cfg.ID),
 		}),
 		cfg:           cfg,
 		http2Listener: newListener(context, cfg.Listener.Addr()),
@@ -112,7 +115,10 @@ func (l *TLSListener) Serve() error {
 			tlsConn, ok := conn.(*tls.Conn)
 			if !ok {
 				conn.Close()
-				log.Errorf("Expected tls.Conn, got %T, internal usage error.", conn)
+				l.log.WithFields(log.Fields{
+					"src_addr": conn.RemoteAddr(),
+					"dst_addr": conn.LocalAddr(),
+				}).Errorf("Expected tls.Conn, got %T, internal usage error.", conn)
 				continue
 			}
 			go l.detectAndForward(tlsConn)
@@ -120,11 +126,11 @@ func (l *TLSListener) Serve() error {
 		}
 		if utils.IsUseOfClosedNetworkError(err) {
 			<-l.context.Done()
-			return trace.Wrap(err, "listener is closed")
+			return nil
 		}
 		select {
 		case <-l.context.Done():
-			return trace.Wrap(net.ErrClosed, "listener is closed")
+			return nil
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -140,8 +146,11 @@ func (l *TLSListener) detectAndForward(conn *tls.Conn) {
 
 	start := l.cfg.Clock.Now()
 	if err := conn.Handshake(); err != nil {
-		if trace.Unwrap(err) != io.EOF {
-			l.log.WithError(err).Warning("Handshake failed.")
+		if !errors.Is(trace.Unwrap(err), io.EOF) {
+			l.log.WithFields(log.Fields{
+				"src_addr": conn.RemoteAddr(),
+				"dst_addr": conn.LocalAddr(),
+			}).WithError(err).Warning("Handshake failed.")
 		}
 		conn.Close()
 		return
@@ -167,7 +176,10 @@ func (l *TLSListener) detectAndForward(conn *tls.Conn) {
 		l.httpListener.HandleConnection(l.context, conn)
 	default:
 		conn.Close()
-		l.log.WithError(err).Errorf("unsupported protocol: %v", conn.ConnectionState().NegotiatedProtocol)
+		l.log.WithFields(log.Fields{
+			"src_addr": conn.RemoteAddr(),
+			"dst_addr": conn.LocalAddr(),
+		}).WithError(err).Errorf("unsupported protocol: %v", conn.ConnectionState().NegotiatedProtocol)
 	}
 }
 

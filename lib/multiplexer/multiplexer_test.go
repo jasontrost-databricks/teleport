@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package multiplexer
 
@@ -75,8 +77,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -114,7 +115,7 @@ func TestMux(t *testing.T) {
 		defer re.Body.Close()
 		bytes, err := io.ReadAll(re.Body)
 		require.NoError(t, err)
-		require.Equal(t, string(bytes), "backend 1")
+		require.Equal(t, "backend 1", string(bytes))
 
 		// Close mux, new requests should fail
 		mux.Close()
@@ -126,7 +127,49 @@ func TestMux(t *testing.T) {
 		if err == nil {
 			re.Body.Close()
 		}
-		require.NotNil(t, err)
+		require.Error(t, err)
+	})
+	t.Run("HTTP", func(t *testing.T) {
+		t.Parallel()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		mux, err := New(Config{
+			Listener: listener,
+		})
+		require.NoError(t, err)
+		go mux.Serve()
+		defer mux.Close()
+
+		backend1 := &httptest.Server{
+			Listener: mux.HTTP(),
+			Config: &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					fmt.Fprintf(w, "backend 1")
+				}),
+			},
+		}
+		backend1.Start()
+		defer backend1.Close()
+
+		re, err := http.Get(backend1.URL)
+		require.NoError(t, err)
+		defer re.Body.Close()
+		bytes, err := io.ReadAll(re.Body)
+		require.NoError(t, err)
+		require.Equal(t, "backend 1", string(bytes))
+
+		// Close mux, new requests should fail
+		mux.Close()
+		mux.Wait()
+
+		// Use new client to use new connection pool
+		client := &http.Client{Transport: &http.Transport{}}
+		re, err = client.Get(backend1.URL)
+		if err == nil {
+			re.Body.Close()
+		}
+		require.Error(t, err)
 	})
 	// ProxyLine tests proxy line protocol
 	t.Run("ProxyLines", func(t *testing.T) {
@@ -160,8 +203,8 @@ func TestMux(t *testing.T) {
 				require.NoError(t, err)
 
 				mux, err := New(Config{
-					Listener:                    listener,
-					EnableExternalProxyProtocol: true,
+					Listener:          listener,
+					PROXYProtocolMode: PROXYProtocolOn,
 				})
 				require.NoError(t, err)
 				go mux.Serve()
@@ -196,9 +239,9 @@ func TestMux(t *testing.T) {
 				out, err := utils.RoundtripWithConn(tlsConn)
 				require.NoError(t, err)
 				if tt.expectedAddress != "" {
-					require.Equal(t, out, tt.expectedAddress)
+					require.Equal(t, tt.expectedAddress, out)
 				} else {
-					require.Equal(t, out, tlsConn.LocalAddr().String())
+					require.Equal(t, tlsConn.LocalAddr().String(), out)
 				}
 			})
 		}
@@ -212,8 +255,8 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: false,
+			Listener:          listener,
+			PROXYProtocolMode: PROXYProtocolOff,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -253,7 +296,99 @@ func TestMux(t *testing.T) {
 
 		// make sure the TLS call failed
 		_, err = utils.RoundtripWithConn(tlsConn)
-		require.NotNil(t, err)
+		require.Error(t, err)
+	})
+
+	// makes sure the connection gets dropped
+	// when PROXY protocol is 'on' but PROXY line isn't received
+	t.Run("required PROXY line", func(t *testing.T) {
+		t.Parallel()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		mux, err := New(Config{
+			Listener:              listener,
+			PROXYProtocolMode:     PROXYProtocolOn,
+			IgnoreSelfConnections: true,
+		})
+		require.NoError(t, err)
+		go mux.Serve()
+		defer mux.Close()
+
+		backend1 := &httptest.Server{
+			Listener: mux.TLS(),
+			Config: &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					fmt.Fprintf(w, r.RemoteAddr)
+				}),
+			},
+		}
+		backend1.StartTLS()
+		defer backend1.Close()
+
+		parsedURL, err := url.Parse(backend1.URL)
+		require.NoError(t, err)
+
+		conn, err := net.Dial("tcp", parsedURL.Host)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		// upgrade connection to TLS
+		tlsConn := tls.Client(conn, clientConfig(backend1))
+		defer tlsConn.Close()
+
+		// make sure the TLS call failed
+		_, err = utils.RoundtripWithConn(tlsConn)
+		require.Error(t, err)
+	})
+
+	// makes sure the connection get port set to 0
+	// when PROXY protocol is unspecified
+	t.Run("source port set to 0 in unspecified PROXY mode", func(t *testing.T) {
+		t.Parallel()
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+
+		mux, err := New(Config{
+			Listener:              listener,
+			PROXYProtocolMode:     PROXYProtocolUnspecified,
+			IgnoreSelfConnections: true,
+		})
+		require.NoError(t, err)
+		go mux.Serve()
+		defer mux.Close()
+
+		backend1 := &httptest.Server{
+			Listener: mux.TLS(),
+			Config: &http.Server{
+				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					fmt.Fprintf(w, r.RemoteAddr)
+				}),
+			},
+		}
+		backend1.StartTLS()
+		defer backend1.Close()
+
+		parsedURL, err := url.Parse(backend1.URL)
+		require.NoError(t, err)
+
+		conn, err := net.Dial("tcp", parsedURL.Host)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		// Write PROXY line into connection to simulate PROXY protocol
+		_, err = conn.Write([]byte(sampleProxyV1Line))
+		require.NoError(t, err)
+
+		// upgrade connection to TLS
+		tlsConn := tls.Client(conn, clientConfig(backend1))
+		defer tlsConn.Close()
+
+		res, err := utils.RoundtripWithConn(tlsConn)
+		require.NoError(t, err)
+
+		// Make sure that server saw our connection with source port set to 0
+		require.Equal(t, "127.0.0.1:0", res)
 	})
 
 	// Timeout test makes sure that multiplexer respects read deadlines.
@@ -266,8 +401,7 @@ func TestMux(t *testing.T) {
 			Listener: listener,
 			// Set read deadline in the past to remove reliance on real time
 			// and simulate scenario when read deadline has elapsed.
-			ReadDeadline:                -time.Millisecond,
-			EnableExternalProxyProtocol: true,
+			DetectTimeout: -time.Millisecond,
 		}
 		mux, err := New(config)
 		require.NoError(t, err)
@@ -298,7 +432,7 @@ func TestMux(t *testing.T) {
 
 		// roundtrip should fail on the timeout
 		_, err = utils.RoundtripWithConn(tlsConn)
-		require.NotNil(t, err)
+		require.Error(t, err)
 	})
 
 	// UnknownProtocol make sure that multiplexer closes connection
@@ -309,8 +443,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -336,8 +469,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -355,11 +487,11 @@ func TestMux(t *testing.T) {
 		defer backend1.Close()
 
 		_, err = ssh.Dial("tcp", listener.Addr().String(), &ssh.ClientConfig{
-			Auth:            []ssh.AuthMethod{ssh.Password("abc123")},
+			Auth:            []ssh.AuthMethod{ssh.Password("abcdef123456")},
 			Timeout:         time.Second,
 			HostKeyCallback: ssh.FixedHostKey(signer.PublicKey()),
 		})
-		require.NotNil(t, err)
+		require.Error(t, err)
 
 		// TLS requests will succeed
 		client := testClient(backend1)
@@ -368,7 +500,7 @@ func TestMux(t *testing.T) {
 		defer re.Body.Close()
 		bytes, err := io.ReadAll(re.Body)
 		require.NoError(t, err)
-		require.Equal(t, string(bytes), "backend 1")
+		require.Equal(t, "backend 1", string(bytes))
 
 		// Close mux, new requests should fail
 		mux.Close()
@@ -380,7 +512,7 @@ func TestMux(t *testing.T) {
 		if err == nil {
 			re.Body.Close()
 		}
-		require.NotNil(t, err)
+		require.Error(t, err)
 	})
 
 	// TestDisableTLS tests scenario with disabled TLS
@@ -390,8 +522,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -428,7 +559,7 @@ func TestMux(t *testing.T) {
 		if err == nil {
 			re.Body.Close()
 		}
-		require.NotNil(t, err)
+		require.Error(t, err)
 
 		// Close mux, new requests should fail
 		mux.Close()
@@ -442,8 +573,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -479,7 +609,7 @@ func TestMux(t *testing.T) {
 		}
 		go func() {
 			err := httpServer.Serve(tlsLis.HTTP())
-			if err == nil || err == http.ErrServerClosed {
+			if err == nil || errors.Is(err, http.ErrServerClosed) {
 				errCh <- nil
 				return
 			}
@@ -493,7 +623,7 @@ func TestMux(t *testing.T) {
 		defer re.Body.Close()
 		bytes, err := io.ReadAll(re.Body)
 		require.NoError(t, err)
-		require.Equal(t, string(bytes), "http backend")
+		require.Equal(t, "http backend", string(bytes))
 
 		creds := credentials.NewClientTLSFromCert(cfg.CertPool, "")
 
@@ -506,7 +636,7 @@ func TestMux(t *testing.T) {
 
 		out, err := gclient.Ping(context.TODO(), &test.Request{})
 		require.NoError(t, err)
-		require.Equal(t, out.GetPayload(), "grpc backend")
+		require.Equal(t, "grpc backend", out.GetPayload())
 
 		// Close mux, new requests should fail
 		mux.Close()
@@ -518,7 +648,7 @@ func TestMux(t *testing.T) {
 		if err == nil {
 			re.Body.Close()
 		}
-		require.NotNil(t, err)
+		require.Error(t, err)
 
 		httpServer.Close()
 		s.Stop()
@@ -538,9 +668,8 @@ func TestMux(t *testing.T) {
 		defer cancel()
 
 		mux, err := New(Config{
-			Context:                     ctx,
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Context:  ctx,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -577,7 +706,7 @@ func TestMux(t *testing.T) {
 		})
 
 		t.Run("with proxy line", func(t *testing.T) {
-			check(t, "127.0.0.1:12345", sampleProxyV2Line)
+			check(t, "127.0.0.1:0", sampleProxyV2Line)
 		})
 	})
 
@@ -589,8 +718,7 @@ func TestMux(t *testing.T) {
 		require.NoError(t, err)
 
 		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
+			Listener: listener,
 		})
 		require.NoError(t, err)
 		go mux.Serve()
@@ -700,13 +828,13 @@ func TestMux(t *testing.T) {
 		// If listener for IPv6 will fail to be created we'll skip IPv6 portion of test.
 		listener6, _ := net.Listen("tcp6", "[::1]:0")
 
-		startServing := func(muxListener net.Listener) (*Mux, *httptest.Server) {
+		startServing := func(muxListener net.Listener, cluster string) (*Mux, *httptest.Server) {
 			mux, err := New(Config{
-				Listener:                    muxListener,
-				EnableExternalProxyProtocol: true,
-				CertAuthorityGetter:         casGetter,
-				Clock:                       clockwork.NewFakeClockAt(time.Now()),
-				LocalClusterName:            clusterName,
+				Listener:            muxListener,
+				PROXYProtocolMode:   PROXYProtocolUnspecified,
+				CertAuthorityGetter: casGetter,
+				Clock:               clockwork.NewFakeClockAt(time.Now()),
+				LocalClusterName:    cluster,
 			})
 			require.NoError(t, err)
 
@@ -728,14 +856,14 @@ func TestMux(t *testing.T) {
 			return mux, backend
 		}
 
-		mux4, backend4 := startServing(listener4)
+		mux4, backend4 := startServing(listener4, clusterName)
 		defer mux4.Close()
 		defer backend4.Close()
 
 		var backend6 *httptest.Server
 		var mux6 *Mux
 		if listener6 != nil {
-			mux6, backend6 = startServing(listener6)
+			mux6, backend6 = startServing(listener6, clusterName)
 			defer mux6.Close()
 			defer backend6.Close()
 		}
@@ -872,9 +1000,8 @@ func TestMux(t *testing.T) {
 
 			clt := tls.Client(conn, clientConfig(backend4))
 
-			out, err := utils.RoundtripWithConn(clt)
-			require.NoError(t, err)
-			require.Equal(t, addr1.String(), out)
+			_, err = utils.RoundtripWithConn(clt)
+			require.Error(t, err)
 		})
 		t.Run("two unsigned PROXY headers, gets an error", func(t *testing.T) {
 			conn, err := net.Dial("tcp", listener4.Addr().String())
@@ -928,63 +1055,34 @@ func TestMux(t *testing.T) {
 
 			out, err := utils.RoundtripWithConn(clt)
 			require.NoError(t, err)
-			require.Equal(t, addr1.String(), out)
+			require.Equal(t, addr1.IP.String()+":0", out)
 		})
-	})
-	// Ensures that we can correctly send and verify signed PROXY header
-	t.Run("signed PROXY header is ignored if signed by wrong cluster", func(t *testing.T) {
-		t.Parallel()
+		t.Run("PROXY header signed by non local cluster get an error", func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:")
+			require.NoError(t, err)
 
-		const clusterName = "teleport-test"
-		tlsProxyCert, _, jwtSigner := getTestCertCAsGetterAndSigner(t, clusterName)
-		_, wrongCAsGetter, _ := getTestCertCAsGetterAndSigner(t, "wrong-cluster")
+			// start multiplexer with wrong cluster name specified
+			mux, backend := startServing(listener, "different-cluster")
+			t.Cleanup(func() {
+				require.NoError(t, mux.Close())
+				backend.Close()
+			})
 
-		listener, err := net.Listen("tcp", "127.0.0.1:")
-		require.NoError(t, err)
+			conn, err := net.Dial("tcp", listener.Addr().String())
+			require.NoError(t, err)
+			defer conn.Close()
 
-		mux, err := New(Config{
-			Listener:                    listener,
-			EnableExternalProxyProtocol: true,
-			CertAuthorityGetter:         wrongCAsGetter,
-			LocalClusterName:            "different-cluster",
+			signedHeader, err := signPROXYHeader(&addr1, &addr2, clusterName, tlsProxyCert, jwtSigner)
+			require.NoError(t, err)
+
+			_, err = conn.Write(signedHeader)
+			require.NoError(t, err)
+
+			clt := tls.Client(conn, clientConfig(backend))
+
+			_, err = utils.RoundtripWithConn(clt)
+			require.Error(t, err)
 		})
-		require.NoError(t, err)
-
-		muxTLSListener := mux.TLS()
-
-		go mux.Serve()
-		defer mux.Close()
-
-		backend := &httptest.Server{
-			Listener: muxTLSListener,
-			Config: &http.Server{
-				Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					fmt.Fprintf(w, r.RemoteAddr)
-				}),
-			},
-		}
-		backend.StartTLS()
-		defer backend.Close()
-
-		conn, err := net.Dial("tcp", listener.Addr().String())
-		require.NoError(t, err)
-		defer conn.Close()
-
-		ip := "1.2.3.4"
-		sAddr := net.TCPAddr{IP: net.ParseIP(ip), Port: 444}
-		dAddr := net.TCPAddr{IP: net.ParseIP(ip), Port: 555}
-
-		signedHeader, err := signPROXYHeader(&sAddr, &dAddr, clusterName, tlsProxyCert, jwtSigner)
-		require.NoError(t, err)
-
-		_, err = conn.Write(signedHeader)
-		require.NoError(t, err)
-
-		clt := tls.Client(conn, clientConfig(backend))
-
-		out, err := utils.RoundtripWithConn(clt)
-		require.NoError(t, err)
-		require.Equal(t, conn.LocalAddr().String(), out)
 	})
 }
 

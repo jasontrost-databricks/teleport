@@ -87,6 +87,18 @@ tests:
           path: spec.replicas
           value: 1
 
+  - it: should have multiple replicas by default when an ingress is terminating TLS
+    template: proxy/deployment.yaml
+    set:
+      clusterName: helm-lint.example.com
+      proxyListenerMode: multiplex
+      ingress:
+        enabled: true
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
+
   - it: should set affinity when set in values
     template: proxy/deployment.yaml
     set:
@@ -212,6 +224,25 @@ tests:
       - matchSnapshot:
           path: spec.template.spec
 
+  - it: should set resources for wait-auth-update initContainer when set in values
+    template: proxy/deployment.yaml
+    values:
+      - ../.lint/resources.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.initContainers[0].resources.requests.cpu
+          value: 0.1
+      - equal:
+          path: spec.template.spec.initContainers[0].resources.requests.memory
+          value: 256Mi
+      - equal:
+          path: spec.template.spec.initContainers[0].resources.limits.cpu
+          value: 1
+      - equal:
+          path: spec.template.spec.initContainers[0].resources.limits.memory
+          value: 512Mi
+      - matchSnapshot:
+          path: spec.template.spec
 
   - it: should not set securityContext for initContainers when is empty object (default value)
     template: proxy/deployment.yaml
@@ -331,6 +362,36 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].imagePullPolicy
           value: Always
+
+  - it: should have only one container when no `extraContainers` is set in values
+    template: proxy/deployment.yaml
+    set:
+      extraContainers: []
+      clusterName: helm-lint.example.com
+    asserts:
+      - isNotNull:
+          path: spec.template.spec.containers[0]
+      - isNull:
+          path: spec.template.spec.containers[1]
+
+  - it: should add one more container when `extraContainers` is set in values
+    template: proxy/deployment.yaml
+    values:
+      - ../.lint/extra-containers.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1]
+          value:
+            name: nscenter
+            command:
+              - /bin/bash
+              - -c
+              - sleep infinity & wait
+            image: praqma/network-multitool
+            imagePullPolicy: IfNotPresent
+            securityContext:
+              privileged: true
+              runAsNonRoot: false
 
   - it: should set environment when extraEnv set in values
     template: proxy/deployment.yaml

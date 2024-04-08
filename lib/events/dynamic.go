@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package events
 
@@ -47,7 +49,7 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		return s
 	}
 
-	var eventType = getFieldEmpty(EventType)
+	eventType := getFieldEmpty(EventType)
 	var e events.AuditEvent
 
 	switch eventType {
@@ -74,9 +76,7 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 	case UserCreateEvent:
 		e = &events.UserCreate{}
 	case UserUpdatedEvent:
-		// note: user.update is a custom code applied on top of the same data as the user.create event
-		//       and they are thus functionally identical. There exists no direct gRPC version of user.update.
-		e = &events.UserCreate{}
+		e = &events.UserUpdate{}
 	case UserPasswordChangeEvent:
 		e = &events.UserPasswordChange{}
 	case AccessRequestCreateEvent:
@@ -121,6 +121,8 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.SessionNetwork{}
 	case RoleCreatedEvent:
 		e = &events.RoleCreate{}
+	case RoleUpdatedEvent:
+		e = &events.RoleUpdate{}
 	case RoleDeletedEvent:
 		e = &events.RoleDelete{}
 	case TrustedClusterCreateEvent:
@@ -128,17 +130,27 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 	case TrustedClusterDeleteEvent:
 		e = &events.TrustedClusterDelete{}
 	case TrustedClusterTokenCreateEvent:
+		//nolint:staticcheck // We still need to support viewing the deprecated event
+		// type for backwards compatibility.
 		e = &events.TrustedClusterTokenCreate{}
+	case ProvisionTokenCreateEvent:
+		e = &events.ProvisionTokenCreate{}
 	case GithubConnectorCreatedEvent:
 		e = &events.GithubConnectorCreate{}
+	case GithubConnectorUpdatedEvent:
+		e = &events.GithubConnectorUpdate{}
 	case GithubConnectorDeletedEvent:
 		e = &events.GithubConnectorDelete{}
 	case OIDCConnectorCreatedEvent:
 		e = &events.OIDCConnectorCreate{}
+	case OIDCConnectorUpdatedEvent:
+		e = &events.OIDCConnectorUpdate{}
 	case OIDCConnectorDeletedEvent:
 		e = &events.OIDCConnectorDelete{}
 	case SAMLConnectorCreatedEvent:
 		e = &events.SAMLConnectorCreate{}
+	case SAMLConnectorUpdatedEvent:
+		e = &events.SAMLConnectorUpdate{}
 	case SAMLConnectorDeletedEvent:
 		e = &events.SAMLConnectorDelete{}
 	case SessionRejectedEvent:
@@ -173,6 +185,12 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.DatabaseSessionQuery{}
 	case DatabaseSessionMalformedPacketEvent:
 		e = &events.DatabaseSessionMalformedPacket{}
+	case DatabaseSessionPermissionsUpdateEvent:
+		e = &events.DatabasePermissionUpdate{}
+	case DatabaseSessionUserCreateEvent:
+		e = &events.DatabaseUserCreate{}
+	case DatabaseSessionUserDeactivateEvent:
+		e = &events.DatabaseUserDeactivate{}
 	case DatabaseSessionPostgresParseEvent:
 		e = &events.PostgresParse{}
 	case DatabaseSessionPostgresBindEvent:
@@ -227,9 +245,13 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.MFADeviceDelete{}
 	case DeviceEvent: // Kept for backwards compatibility.
 		e = &events.DeviceEvent{}
-	case DeviceCreateEvent, DeviceDeleteEvent, DeviceUpdateEvent,
-		DeviceEnrollEvent, DeviceAuthenticateCode,
-		DeviceEnrollTokenCreateEvent:
+	case DeviceCreateEvent,
+		DeviceDeleteEvent,
+		DeviceUpdateEvent,
+		DeviceEnrollEvent,
+		DeviceAuthenticateEvent,
+		DeviceEnrollTokenCreateEvent,
+		DeviceWebTokenCreateEvent:
 		e = &events.DeviceEvent2{}
 	case LockCreatedEvent:
 		e = &events.LockCreate{}
@@ -283,6 +305,12 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.BotJoin{}
 	case InstanceJoinEvent:
 		e = &events.InstanceJoin{}
+	case BotCreateEvent:
+		e = &events.BotCreate{}
+	case BotUpdateEvent:
+		e = &events.BotUpdate{}
+	case BotDeleteEvent:
+		e = &events.BotDelete{}
 	case LoginRuleCreateEvent:
 		e = &events.LoginRuleCreate{}
 	case LoginRuleDeleteEvent:
@@ -297,10 +325,60 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.SAMLIdPServiceProviderDelete{}
 	case SAMLIdPServiceProviderDeleteAllEvent:
 		e = &events.SAMLIdPServiceProviderDeleteAll{}
+	case OktaGroupsUpdateEvent:
+		e = &events.OktaResourcesUpdate{}
+	case OktaApplicationsUpdateEvent:
+		e = &events.OktaResourcesUpdate{}
+	case OktaSyncFailureEvent:
+		e = &events.OktaSyncFailure{}
+	case OktaAssignmentProcessEvent:
+		e = &events.OktaAssignmentResult{}
+	case OktaAssignmentCleanupEvent:
+		e = &events.OktaAssignmentResult{}
+	case OktaUserSyncEvent:
+		e = &events.OktaUserSync{}
+	case OktaAccessListSyncEvent:
+		e = &events.OktaAccessListSync{}
+	case AccessListCreateEvent:
+		e = &events.AccessListCreate{}
+	case AccessListUpdateEvent:
+		e = &events.AccessListUpdate{}
+	case AccessListDeleteEvent:
+		e = &events.AccessListDelete{}
+	case AccessListReviewEvent:
+		e = &events.AccessListReview{}
+	case AccessListMemberCreateEvent:
+		e = &events.AccessListMemberCreate{}
+	case AccessListMemberUpdateEvent:
+		e = &events.AccessListMemberUpdate{}
+	case AccessListMemberDeleteEvent:
+		e = &events.AccessListMemberDelete{}
+	case AccessListMemberDeleteAllForAccessListEvent:
+		e = &events.AccessListMemberDeleteAllForAccessList{}
+	case SecReportsAuditQueryRunEvent:
+		e = &events.AuditQueryRun{}
+	case SecReportsReportRunEvent:
+		e = &events.SecurityReportRun{}
+	case ExternalAuditStorageEnableEvent:
+		e = &events.ExternalAuditStorageEnable{}
+	case ExternalAuditStorageDisableEvent:
+		e = &events.ExternalAuditStorageDisable{}
+	case CreateMFAAuthChallengeEvent:
+		e = &events.CreateMFAAuthChallenge{}
+	case ValidateMFAAuthResponseEvent:
+		e = &events.ValidateMFAAuthResponse{}
+	case SPIFFESVIDIssuedEvent:
+		e = &events.SPIFFESVIDIssued{}
+	case AuthPreferenceUpdateEvent:
+		e = &events.AuthPreferenceUpdate{}
+	case ClusterNetworkingConfigUpdateEvent:
+		e = &events.ClusterNetworkingConfigUpdate{}
+	case SessionRecordingConfigUpdateEvent:
+		e = &events.SessionRecordingConfigUpdate{}
+
 	case UnknownEvent:
 		e = &events.Unknown{}
 
-	// Cassandra events.
 	case CassandraBatchEventCode:
 		e = &events.CassandraBatch{}
 	case CassandraRegisterEventCode:
@@ -311,7 +389,7 @@ func FromEventFields(fields EventFields) (events.AuditEvent, error) {
 		e = &events.CassandraExecute{}
 
 	default:
-		log.Errorf("Attempted to convert dynamic event of unknown type \"%v\" into protobuf event.", eventType)
+		log.Errorf("Attempted to convert dynamic event of unknown type %q into protobuf event.", eventType)
 		unknown := &events.Unknown{}
 		if err := utils.FastUnmarshal(data, unknown); err != nil {
 			return nil, trace.Wrap(err)
@@ -342,6 +420,18 @@ func GetSessionID(event events.AuditEvent) string {
 	}
 
 	return sessionID
+}
+
+// GetTeleportUser pulls the teleport user from the events that have a
+// UserMetadata. For other events an empty string is returned.
+func GetTeleportUser(event events.AuditEvent) string {
+	type userGetter interface {
+		GetUser() string
+	}
+	if g, ok := event.(userGetter); ok {
+		return g.GetUser()
+	}
+	return ""
 }
 
 // ToEventFields converts from the typed interface-style event representation

@@ -1,34 +1,44 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package services
 
 import (
 	"context"
+	"net/url"
+	"slices"
 
+	"github.com/crewjam/saml"
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-// SAMLIdPServiceProvider defines an interface for managing SAML IdP service providers.
+// SAMLIdpServiceProviderGetter defines interface for fetching SAMLIdPServiceProvider resources.
+type SAMLIdpServiceProviderGetter interface {
+	ListSAMLIdPServiceProviders(ctx context.Context, pageSize int, nextKey string) ([]types.SAMLIdPServiceProvider, string, error)
+}
+
+// SAMLIdPServiceProviders defines an interface for managing SAML IdP service providers.
 type SAMLIdPServiceProviders interface {
-	// ListSAMLIdPServiceProviders returns a paginated list of all SAML IdP service provider resources.
-	ListSAMLIdPServiceProviders(context.Context, int, string) ([]types.SAMLIdPServiceProvider, string, error)
+	SAMLIdpServiceProviderGetter
 	// GetSAMLIdPServiceProvider returns the specified SAML IdP service provider resources.
 	GetSAMLIdPServiceProvider(ctx context.Context, name string) (types.SAMLIdPServiceProvider, error)
 	// CreateSAMLIdPServiceProvider creates a new SAML IdP service provider resource.
@@ -43,10 +53,6 @@ type SAMLIdPServiceProviders interface {
 
 // MarshalSAMLIdPServiceProvider marshals the SAMLIdPServiceProvider resource to JSON.
 func MarshalSAMLIdPServiceProvider(serviceProvider types.SAMLIdPServiceProvider, opts ...MarshalOption) ([]byte, error) {
-	if err := serviceProvider.CheckAndSetDefaults(); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
 	cfg, err := CollectOptions(opts)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -54,12 +60,11 @@ func MarshalSAMLIdPServiceProvider(serviceProvider types.SAMLIdPServiceProvider,
 
 	switch sp := serviceProvider.(type) {
 	case *types.SAMLIdPServiceProviderV1:
-		if !cfg.PreserveResourceID {
-			copy := *sp
-			copy.SetResourceID(0)
-			sp = &copy
+		if err := sp.CheckAndSetDefaults(); err != nil {
+			return nil, trace.Wrap(err)
 		}
-		return utils.FastMarshal(sp)
+
+		return utils.FastMarshal(maybeResetProtoResourceID(cfg.PreserveResourceID, sp))
 	default:
 		return nil, trace.BadParameter("unsupported SAML IdP service provider resource %T", sp)
 	}
@@ -90,10 +95,81 @@ func UnmarshalSAMLIdPServiceProvider(data []byte, opts ...MarshalOption) (types.
 		if cfg.ID != 0 {
 			s.SetResourceID(cfg.ID)
 		}
+		if cfg.Revision != "" {
+			s.SetRevision(cfg.Revision)
+		}
 		if !cfg.Expires.IsZero() {
 			s.SetExpiry(cfg.Expires)
 		}
 		return &s, nil
 	}
 	return nil, trace.BadParameter("unsupported SAML IdP service provider resource version %q", h.Version)
+}
+
+// supportedACSBindings is the set of AssertionConsumerService bindings that teleport supports.
+var supportedACSBindings = map[string]struct{}{
+	saml.HTTPPostBinding:     {},
+	saml.HTTPRedirectBinding: {},
+}
+
+// ValidateAssertionConsumerService checks if a given assertion consumer service is usable by teleport. Note that
+// it is permissible for a service provider to include acs endpoints that are not compatible with teleport, so long
+// as at least one _is_ compatible.
+func ValidateAssertionConsumerService(acs saml.IndexedEndpoint) error {
+	if _, ok := supportedACSBindings[acs.Binding]; !ok {
+		return trace.BadParameter("unsupported acs binding: %q", acs.Binding)
+	}
+
+	if acs.Location == "" {
+		return trace.BadParameter("acs location endpoint is missing or could not be decoded for %q binding", acs.Binding)
+	}
+
+	return trace.Wrap(ValidateAssertionConsumerServicesEndpoint(acs.Location))
+}
+
+// FilterSAMLEntityDescriptor performs a filter in place to remove unsupported and/or insecure fields from
+// a saml entity descriptor. Specifically, it removes acs endpoints that are either of an unsupported kind,
+// or are using a non-https endpoint. We perform filtering rather than outright rejection because it is generally
+// expected that a service provider will successfully support a given ACS so long as they have at least one
+// compatible binding.
+func FilterSAMLEntityDescriptor(ed *saml.EntityDescriptor, quiet bool) error {
+	var originalCount int
+	var filteredCount int
+	for i := range ed.SPSSODescriptors {
+		filtered := slices.DeleteFunc(ed.SPSSODescriptors[i].AssertionConsumerServices, func(acs saml.IndexedEndpoint) bool {
+			if err := ValidateAssertionConsumerService(acs); err != nil {
+				if !quiet {
+					log.Warnf("AssertionConsumerService binding for entity %q is invalid and will be ignored: %v", ed.EntityID, err)
+				}
+				return true
+			}
+
+			return false
+		})
+
+		originalCount += len(ed.SPSSODescriptors[i].AssertionConsumerServices)
+		filteredCount += len(filtered)
+
+		ed.SPSSODescriptors[i].AssertionConsumerServices = filtered
+	}
+
+	if filteredCount == 0 && originalCount != 0 {
+		return trace.BadParameter("no AssertionConsumerService bindings for entity %q passed validation", ed.EntityID)
+	}
+
+	return nil
+}
+
+// ValidateAssertionConsumerServicesEndpoint ensures that the Assertion Consumer Service location
+// is a valid HTTPS endpoint.
+func ValidateAssertionConsumerServicesEndpoint(acs string) error {
+	endpoint, err := url.Parse(acs)
+	switch {
+	case err != nil:
+		return trace.BadParameter("acs location endpoint %q could not be parsed: %v", acs, err)
+	case endpoint.Scheme != "https":
+		return trace.BadParameter("invalid scheme %q in acs location endpoint %q (must be 'https')", endpoint.Scheme, acs)
+	}
+
+	return nil
 }

@@ -1,34 +1,42 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/constants"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth/mocku2f"
-	wanlib "github.com/gravitational/teleport/lib/auth/webauthn"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/services"
 )
@@ -152,7 +160,8 @@ func TestServer_CreateAuthenticateChallenge_authPreference(t *testing.T) {
 
 			authPreference, err := types.NewAuthPreference(*test.spec)
 			require.NoError(t, err)
-			require.NoError(t, authServer.SetAuthPreference(ctx, authPreference))
+			_, err = authServer.UpsertAuthPreference(ctx, authPreference)
+			require.NoError(t, err)
 
 			challenge, err := authServer.CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
 				Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{
@@ -186,7 +195,8 @@ func TestCreateAuthenticateChallenge_WithAuth(t *testing.T) {
 	// TODO(codingllama): Use a public endpoint to verify?
 	mfaResp, err := u.webDev.SolveAuthn(res)
 	require.NoError(t, err)
-	_, _, err = srv.Auth().validateMFAAuthResponse(ctx, mfaResp, u.username, false /* passwordless */)
+	requiredExt := &mfav1.ChallengeExtensions{Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_LOGIN}
+	_, err = srv.Auth().ValidateMFAAuthResponse(ctx, mfaResp, u.username, requiredExt)
 	require.NoError(t, err)
 }
 
@@ -267,9 +277,9 @@ func TestCreateAuthenticateChallenge_WithUserCredentials_WithLock(t *testing.T) 
 
 		// Test last attempt returns locked error.
 		if i == defaults.MaxLoginAttempts {
-			require.Equal(t, err.Error(), MaxFailedAttemptsErrMsg)
+			require.Equal(t, MaxFailedAttemptsErrMsg, err.Error())
 		} else {
-			require.NotEqual(t, err.Error(), MaxFailedAttemptsErrMsg)
+			require.NotEqual(t, MaxFailedAttemptsErrMsg, err.Error())
 		}
 	}
 }
@@ -339,6 +349,222 @@ func TestCreateAuthenticateChallenge_WithRecoveryStartToken(t *testing.T) {
 	}
 }
 
+func TestCreateAuthenticateChallenge_mfaVerification(t *testing.T) {
+	t.Parallel()
+
+	testServer := newTestTLSServer(t)
+	ctx := context.Background()
+
+	adminClient, err := testServer.NewClient(TestBuiltin(types.RoleAdmin))
+	require.NoError(t, err, "NewClient(types.RoleAdmin)")
+
+	// Register a couple of SSH nodes.
+	registerNode := func(node, env string) error {
+		_, err := adminClient.UpsertNode(ctx, &types.ServerV2{
+			Kind:    types.KindNode,
+			Version: types.V2,
+			Metadata: types.Metadata{
+				Name: uuid.NewString(),
+				Labels: map[string]string{
+					"env": env,
+				},
+			},
+			Spec: types.ServerSpecV2{
+				Hostname: node,
+			},
+		})
+		return err
+	}
+	const devNode = "node1"
+	const prodNode = "node2"
+	require.NoError(t, registerNode(devNode, "dev"), "registerNode(%q)", devNode)
+	require.NoError(t, registerNode(prodNode, "prod"), "registerNode(%q)", prodNode)
+
+	// Create an MFA required role for "prod" nodes.
+	prodRole, err := types.NewRole("prod_access", types.RoleSpecV6{
+		Options: types.RoleOptions{
+			RequireMFAType: types.RequireMFAType_SESSION,
+		},
+		Allow: types.RoleConditions{
+			Logins: []string{"{{internal.logins}}"},
+			NodeLabels: types.Labels{
+				"env": []string{"prod"},
+			},
+		},
+	})
+	require.NoError(t, err, "NewRole(prod)")
+	prodRole, err = adminClient.UpsertRole(ctx, prodRole)
+	require.NoError(t, err, "UpsertRole(%q)", prodRole.GetName())
+
+	// Create a role that requires MFA when joining sessions
+	joinMFARole, err := types.NewRole("mfa_session_join", types.RoleSpecV6{
+		Options: types.RoleOptions{
+			RequireMFAType: types.RequireMFAType_SESSION,
+		},
+		Allow: types.RoleConditions{
+			Logins: []string{"{{internal.logins}}"},
+			NodeLabels: types.Labels{
+				"env": []string{"*"},
+			},
+			JoinSessions: []*types.SessionJoinPolicy{
+				{
+					Name:  "session_join",
+					Roles: []string{"access"},
+					Kinds: []string{string(types.SSHSessionKind)},
+					Modes: []string{string(types.SessionPeerMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err, "NewRole(joinMFA)")
+	joinMFARole, err = adminClient.UpsertRole(ctx, joinMFARole)
+	require.NoError(t, err, "UpsertRole(%q)", joinMFARole.GetName())
+
+	// Create a role that doesn't require MFA when joining sessions
+	joinNoMFARole, err := types.NewRole("no_mfa_session_join", types.RoleSpecV6{
+		Allow: types.RoleConditions{
+			Logins: []string{"{{internal.logins}}"},
+			NodeLabels: types.Labels{
+				"env": []string{"*"},
+			},
+			JoinSessions: []*types.SessionJoinPolicy{
+				{
+					Name:  "session_join",
+					Roles: []string{"access"},
+					Kinds: []string{string(types.SSHSessionKind)},
+					Modes: []string{string(types.SessionPeerMode)},
+				},
+			},
+		},
+	})
+	require.NoError(t, err, "NewRole(joinNoMFA)")
+	joinNoMFARole, err = adminClient.UpsertRole(ctx, joinNoMFARole)
+	require.NoError(t, err, "UpsertRole(%q)", joinNoMFARole.GetName())
+
+	const normalLogin = "llama"
+	createUser := func(role types.Role) *Client {
+		// Create a user with MFA devices...
+		userCreds, err := createUserWithSecondFactors(testServer)
+		require.NoError(t, err, "createUserWithSecondFactors")
+		username := userCreds.username
+
+		// ...and assign the user a sane unix login, plus the specified role.
+		user, err := adminClient.GetUser(ctx, username, false /* withSecrets */)
+		require.NoError(t, err, "GetUser(%q)", username)
+
+		user.SetLogins(append(user.GetLogins(), normalLogin))
+		user.AddRole(role.GetName())
+		_, err = adminClient.UpdateUser(ctx, user.(*types.UserV2))
+		require.NoError(t, err, "UpdateUser(%q)", username)
+
+		userClient, err := testServer.NewClient(TestUser(username))
+		require.NoError(t, err, "NewClient(%q)", username)
+
+		return userClient
+	}
+
+	prodAccessClient := createUser(prodRole)
+	joinMFAClient := createUser(joinMFARole)
+	joinNoMFAClient := createUser(joinNoMFARole)
+
+	createReqForNode := func(node, login string) *proto.CreateAuthenticateChallengeRequest {
+		return &proto.CreateAuthenticateChallengeRequest{
+			Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+				ContextUser: &proto.ContextUser{},
+			},
+			MFARequiredCheck: &proto.IsMFARequiredRequest{
+				Target: &proto.IsMFARequiredRequest_Node{
+					Node: &proto.NodeLogin{
+						Node:  node,
+						Login: login,
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		userClient      *Client
+		req             *proto.CreateAuthenticateChallengeRequest
+		wantMFARequired proto.MFARequired
+		wantChallenges  bool
+	}{
+		{
+			name:            "MFA not required to start session, no challenges issued",
+			userClient:      prodAccessClient,
+			req:             createReqForNode(devNode, normalLogin),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_NO,
+		},
+		{
+			name:            "MFA required to start session",
+			userClient:      prodAccessClient,
+			req:             createReqForNode(prodNode, normalLogin),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			wantChallenges:  true,
+		},
+		{
+			name:            "MFA required to join session on prod node (prod role)",
+			userClient:      prodAccessClient,
+			req:             createReqForNode(prodNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			wantChallenges:  true,
+		},
+		{
+			name:            "MFA required to join session on dev node (prod role)",
+			userClient:      prodAccessClient,
+			req:             createReqForNode(devNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			wantChallenges:  true,
+		},
+		{
+			name:            "MFA required to join session on prod node (join MFA role)",
+			userClient:      joinMFAClient,
+			req:             createReqForNode(prodNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			wantChallenges:  true,
+		},
+		{
+			name:            "MFA required to join session dev node (join MFA role)",
+			userClient:      joinMFAClient,
+			req:             createReqForNode(prodNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_YES,
+			wantChallenges:  true,
+		},
+		{
+			name:            "MFA not required to join session, no challenges issued on dev node (join no MFA role)",
+			userClient:      joinNoMFAClient,
+			req:             createReqForNode(devNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_NO,
+		},
+		{
+			name:            "MFA not required to join session, no challenges issued on prod node (join no MFA role)",
+			userClient:      joinNoMFAClient,
+			req:             createReqForNode(prodNode, teleport.SSHSessionJoinPrincipal),
+			wantMFARequired: proto.MFARequired_MFA_REQUIRED_NO,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			resp, err := test.userClient.CreateAuthenticateChallenge(ctx, test.req)
+			require.NoError(t, err, "CreateAuthenticateChallenge")
+
+			assert.Equal(t, test.wantMFARequired, resp.MFARequired, "resp.MFARequired mismatch")
+
+			if test.wantChallenges {
+				assert.NotNil(t, resp.GetTOTP(), "resp.TOTP")
+				assert.NotNil(t, resp.GetWebauthnChallenge(), "resp.WebauthnChallenge")
+			} else {
+				assert.Nil(t, resp.GetTOTP(), "resp.TOTP")
+				assert.Nil(t, resp.GetWebauthnChallenge(), "resp.WebauthnChallenge")
+			}
+		})
+	}
+}
+
 func TestCreateRegisterChallenge(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -380,7 +606,6 @@ func TestCreateRegisterChallenge(t *testing.T) {
 			deviceType: proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
 		},
 	}
-
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
@@ -397,6 +622,143 @@ func TestCreateRegisterChallenge(t *testing.T) {
 			case proto.DeviceType_DEVICE_TYPE_WEBAUTHN:
 				require.NotNil(t, res.GetWebauthn())
 			}
+		})
+	}
+
+	t.Run("register using context user", func(t *testing.T) {
+		authClient, err := srv.NewClient(TestUser(u.username))
+		require.NoError(t, err, "NewClient(%q)", u.username)
+
+		// Attempt without a token or a solved authn challenge should fail.
+		_, err = authClient.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+			DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+			DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+		})
+		assert.ErrorContains(t, err, "second factor authentication required")
+
+		// Acquire and solve an authn challenge.
+		authnChal, err := authClient.CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
+			Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+				ContextUser: &proto.ContextUser{},
+			},
+		})
+		require.NoError(t, err, "CreateAuthenticateChallenge")
+		authnSolved, err := u.webDev.SolveAuthn(authnChal)
+		require.NoError(t, err, "SolveAuthn")
+
+		// Attempt with a solved authn challenge should work.
+		registerChal, err := authClient.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+			ExistingMFAResponse: authnSolved,
+			DeviceType:          proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+			DeviceUsage:         proto.DeviceUsage_DEVICE_USAGE_MFA,
+		})
+		require.NoError(t, err, "CreateRegisterChallenge")
+		assert.NotNil(t, registerChal.GetWebauthn(), "CreateRegisterChallenge returned a nil Webauthn challenge")
+	})
+}
+
+// TestCreateRegisterChallenge_unusableDevice tests that it is possible to
+// register new devices even if the user has an "unusable" device (due to
+// cluster setting changes).
+func TestCreateRegisterChallenge_unusableDevice(t *testing.T) {
+	t.Parallel()
+
+	testServer := newTestTLSServer(t)
+	authServer := testServer.Auth()
+	clock := authServer.GetClock()
+	ctx := context.Background()
+
+	initialPref, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOptional, // most permissive setting
+		Webauthn: &types.Webauthn{
+			RPID: "localhost",
+		},
+	})
+	require.NoError(t, err, "NewAuthPreference")
+
+	setAuthPref := func(t *testing.T, authPref types.AuthPreference) {
+		_, err = authServer.UpsertAuthPreference(ctx, authPref)
+		require.NoError(t, err, "UpsertAuthPreference")
+	}
+	setAuthPref(t, initialPref)
+
+	tests := []struct {
+		name                  string
+		existingType, newType proto.DeviceType
+		newAuthSpec           types.AuthPreferenceSpecV2
+	}{
+		{
+			name:         "unusable totp, new webauthn",
+			existingType: proto.DeviceType_DEVICE_TYPE_TOTP,
+			newType:      proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+			newAuthSpec: types.AuthPreferenceSpecV2{
+				Type:         initialPref.GetType(),
+				SecondFactor: constants.SecondFactorWebauthn, // makes TOTP unusable
+				Webauthn: func() *types.Webauthn {
+					w, _ := initialPref.GetWebauthn()
+					return w
+				}(),
+			},
+		},
+		{
+			name:         "unusable webauthn, new totp",
+			existingType: proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+			newType:      proto.DeviceType_DEVICE_TYPE_TOTP,
+			newAuthSpec: types.AuthPreferenceSpecV2{
+				Type:         initialPref.GetType(),
+				SecondFactor: constants.SecondFactorOTP, // makes Webauthn unusable
+			},
+		},
+	}
+
+	devOpts := []TestDeviceOpt{WithTestDeviceClock(clock)}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setAuthPref(t, initialPref) // restore permissive settings.
+
+			// Create user.
+			username := fmt.Sprintf("llama-%d", i)
+			user, _, err := CreateUserAndRole(authServer, username, []string{username} /* logins */, nil /* allowRules */)
+			require.NoError(t, err, "CreateUserAndRole")
+			userClient, err := testServer.NewClient(TestUser(user.GetName()))
+			require.NoError(t, err, "NewClient")
+
+			// Register initial MFA device.
+			_, err = RegisterTestDevice(
+				ctx,
+				userClient,
+				"existing", test.existingType, nil /* authenticator */, devOpts...)
+			require.NoError(t, err, "RegisterTestDevice")
+
+			// Sanity check: register challenges for test.existingType require a
+			// solved authn challenge.
+			_, err = userClient.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+				ExistingMFAResponse: &proto.MFAAuthenticateResponse{},
+				DeviceType:          test.existingType,
+				DeviceUsage:         proto.DeviceUsage_DEVICE_USAGE_MFA, // not important for this test
+			})
+			assert.ErrorContains(t, err, "second factor")
+
+			// Restore initial settings after test.
+			defer func() {
+				setAuthPref(t, initialPref)
+			}()
+
+			// Change cluster settings.
+			// This should make the device registered above unusable.
+			newAuthPref, err := types.NewAuthPreference(test.newAuthSpec)
+			require.NoError(t, err, "NewAuthPreference")
+			setAuthPref(t, newAuthPref)
+
+			// Create a challenge for the "new" device without an ExistingMFAResponse.
+			// Not allowed if the device above was usable.
+			_, err = userClient.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+				ExistingMFAResponse: &proto.MFAAuthenticateResponse{},
+				DeviceType:          test.newType,
+				DeviceUsage:         proto.DeviceUsage_DEVICE_USAGE_MFA, // not important for this test
+			})
+			assert.NoError(t, err, "CreateRegisterChallenge")
 		})
 	}
 }
@@ -453,7 +815,7 @@ func TestServer_AuthenticateUser_mfaDevices(t *testing.T) {
 
 				switch {
 				case resp.GetWebauthn() != nil:
-					authReq.Webauthn = wanlib.CredentialAssertionResponseFromProto(resp.GetWebauthn())
+					authReq.Webauthn = wantypes.CredentialAssertionResponseFromProto(resp.GetWebauthn())
 				case resp.GetTOTP() != nil:
 					authReq.OTP = &OTPCreds{
 						Password: []byte(password),
@@ -497,11 +859,12 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	require.NoError(t, authServer.SetAuthPreference(ctx, authPreference))
+	_, err = authServer.UpsertAuthPreference(ctx, authPreference)
+	require.NoError(t, err)
 
 	// Create user and initial WebAuthn device (MFA).
 	const user = "llama"
-	const password = "p@ssw0rd"
+	const password = "p@ssw0rd1234"
 	_, _, err = CreateUserAndRole(authServer, user, []string{"llama", "root"}, nil)
 	require.NoError(t, err)
 	require.NoError(t, authServer.UpsertPassword(user, []byte(password)))
@@ -537,14 +900,14 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 	require.NoError(t, err)
 	pwdKey.SetPasswordless()
 	const origin = "https://localhost"
-	ccr, err := pwdKey.SignCredentialCreation(origin, wanlib.CredentialCreationFromProto(registerChallenge.GetWebauthn()))
+	ccr, err := pwdKey.SignCredentialCreation(origin, wantypes.CredentialCreationFromProto(registerChallenge.GetWebauthn()))
 	require.NoError(t, err)
 	_, err = userClient.AddMFADeviceSync(ctx, &proto.AddMFADeviceSyncRequest{
 		TokenID:       token.GetName(),
 		NewDeviceName: "pwdless1",
 		NewMFAResponse: &proto.MFARegisterResponse{
 			Response: &proto.MFARegisterResponse_Webauthn{
-				Webauthn: wanlib.CredentialCreationResponseToProto(ccr),
+				Webauthn: wantypes.CredentialCreationResponseToProto(ccr),
 			},
 		},
 	})
@@ -567,11 +930,11 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 	tests := []struct {
 		name         string
 		loginHooks   []LoginHook
-		authenticate func(t *testing.T, resp *wanlib.CredentialAssertionResponse)
+		authenticate func(t *testing.T, resp *wantypes.CredentialAssertionResponse)
 	}{
 		{
 			name: "ssh",
-			authenticate: func(t *testing.T, resp *wanlib.CredentialAssertionResponse) {
+			authenticate: func(t *testing.T, resp *wantypes.CredentialAssertionResponse) {
 				loginResp, err := proxyClient.AuthenticateSSHUser(ctx, AuthenticateSSHRequest{
 					AuthenticateUserRequest: AuthenticateUserRequest{
 						Webauthn:  resp,
@@ -591,7 +954,7 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 				loginHook,
 				loginHook,
 			},
-			authenticate: func(t *testing.T, resp *wanlib.CredentialAssertionResponse) {
+			authenticate: func(t *testing.T, resp *wantypes.CredentialAssertionResponse) {
 				loginResp, err := proxyClient.AuthenticateSSHUser(ctx, AuthenticateSSHRequest{
 					AuthenticateUserRequest: AuthenticateUserRequest{
 						Webauthn:  resp,
@@ -607,7 +970,7 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 		},
 		{
 			name: "web",
-			authenticate: func(t *testing.T, resp *wanlib.CredentialAssertionResponse) {
+			authenticate: func(t *testing.T, resp *wantypes.CredentialAssertionResponse) {
 				session, err := proxyClient.AuthenticateWebUser(ctx, AuthenticateUserRequest{
 					Webauthn: resp,
 				})
@@ -620,7 +983,7 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 			loginHooks: []LoginHook{
 				loginHook,
 			},
-			authenticate: func(t *testing.T, resp *wanlib.CredentialAssertionResponse) {
+			authenticate: func(t *testing.T, resp *wantypes.CredentialAssertionResponse) {
 				session, err := proxyClient.AuthenticateWebUser(ctx, AuthenticateUserRequest{
 					Webauthn: resp,
 				})
@@ -641,12 +1004,12 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 			_, err := proxyClient.AuthenticateSSHUser(ctx, AuthenticateSSHRequest{
 				AuthenticateUserRequest: AuthenticateUserRequest{
 					Username:  user,
-					Webauthn:  &wanlib.CredentialAssertionResponse{}, // bad response
+					Webauthn:  &wantypes.CredentialAssertionResponse{}, // bad response
 					PublicKey: []byte(sshPubKey),
 				},
 				TTL: 24 * time.Hour,
 			})
-			require.True(t, trace.IsAccessDenied(err), "got err = %v, want AccessDenied")
+			require.True(t, trace.IsAccessDenied(err), "got err = %v, want AccessDenied", err)
 			attempts, err := authServer.GetUserLoginAttempts(user)
 			require.NoError(t, err)
 			require.NotEmpty(t, attempts, "Want at least one failed login attempt")
@@ -660,7 +1023,7 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 			require.NoError(t, err, "Failed to create passwordless challenge")
 
 			// Sign challenge (mocks user interaction).
-			assertionResp, err := pwdKey.SignAssertion(origin, wanlib.CredentialAssertionFromProto(mfaChallenge.GetWebauthnChallenge()))
+			assertionResp, err := pwdKey.SignAssertion(origin, wantypes.CredentialAssertionFromProto(mfaChallenge.GetWebauthnChallenge()))
 			require.NoError(t, err)
 			assertionResp.AssertionResponse.UserHandle = userWebID // identify user, a real device would set this
 
@@ -673,7 +1036,7 @@ func TestServer_Authenticate_passwordless(t *testing.T) {
 			require.NoError(t, err)
 			require.Empty(t, attempts, "Login attempts not reset")
 
-			require.Equal(t, len(test.loginHooks), int(loginHookCounter.Load()))
+			require.Len(t, test.loginHooks, int(loginHookCounter.Load()))
 		})
 	}
 }
@@ -707,7 +1070,7 @@ func TestServer_Authenticate_nonPasswordlessRequiresUsername(t *testing.T) {
 		{
 			name:    "WebAuthn",
 			dev:     mfa.WebDev,
-			wantErr: "invalid Webauthn response", // generic error as it _could_ be a passwordless attempt
+			wantErr: "invalid credentials", // generic error as it _could_ be a passwordless attempt
 		},
 	}
 	for _, test := range tests {
@@ -727,7 +1090,7 @@ func TestServer_Authenticate_nonPasswordlessRequiresUsername(t *testing.T) {
 			}
 			switch {
 			case mfaResp.GetWebauthn() != nil:
-				req.Webauthn = wanlib.CredentialAssertionResponseFromProto(mfaResp.GetWebauthn())
+				req.Webauthn = wantypes.CredentialAssertionResponseFromProto(mfaResp.GetWebauthn())
 			case mfaResp.GetTOTP() != nil:
 				req.OTP = &OTPCreds{
 					Password: []byte(password),
@@ -764,37 +1127,34 @@ func TestServer_Authenticate_headless(t *testing.T) {
 
 	for _, tc := range []struct {
 		name      string
+		timeout   time.Duration
 		update    func(*types.HeadlessAuthentication, *types.MFADevice)
 		expectErr bool
 	}{
 		{
-			name: "OK approved",
+			name:    "OK approved",
+			timeout: 10 * time.Second,
 			update: func(ha *types.HeadlessAuthentication, mfa *types.MFADevice) {
 				ha.State = types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_APPROVED
 				ha.MfaDevice = mfa
 			},
 		}, {
-			name: "NOK approved without MFA",
+			name:    "NOK approved without MFA",
+			timeout: 10 * time.Second,
 			update: func(ha *types.HeadlessAuthentication, mfa *types.MFADevice) {
 				ha.State = types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_APPROVED
 			},
 			expectErr: true,
 		}, {
-			name: "NOK user mismatch",
-			update: func(ha *types.HeadlessAuthentication, mfa *types.MFADevice) {
-				ha.State = types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_APPROVED
-				ha.MfaDevice = mfa
-				ha.User = "other-user"
-			},
-			expectErr: true,
-		}, {
-			name: "NOK denied",
+			name:    "NOK denied",
+			timeout: 10 * time.Second,
 			update: func(ha *types.HeadlessAuthentication, mfa *types.MFADevice) {
 				ha.State = types.HeadlessAuthenticationState_HEADLESS_AUTHENTICATION_STATE_DENIED
 			},
 			expectErr: true,
 		}, {
 			name:      "NOK timeout",
+			timeout:   100 * time.Millisecond,
 			update:    func(ha *types.HeadlessAuthentication, mfa *types.MFADevice) {},
 			expectErr: true,
 		},
@@ -816,7 +1176,7 @@ func TestServer_Authenticate_headless(t *testing.T) {
 			_, err = proxyClient.AuthenticateSSHUser(ctx, AuthenticateSSHRequest{
 				AuthenticateUserRequest: AuthenticateUserRequest{
 					Username:  username,
-					Webauthn:  &wanlib.CredentialAssertionResponse{}, // bad response
+					Webauthn:  &wantypes.CredentialAssertionResponse{}, // bad response
 					PublicKey: []byte(sshPubKey),
 				},
 				TTL: 24 * time.Hour,
@@ -826,7 +1186,7 @@ func TestServer_Authenticate_headless(t *testing.T) {
 			require.NoError(t, err)
 			require.NotEmpty(t, attempts, "Want at least one failed login attempt")
 
-			ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			ctx, cancel := context.WithTimeout(ctx, tc.timeout)
 			defer cancel()
 
 			// Start a goroutine to catch the headless authentication attempt and update with test case values.
@@ -834,7 +1194,13 @@ func TestServer_Authenticate_headless(t *testing.T) {
 			go func() {
 				defer close(errC)
 
-				headlessAuthn, err := srv.Auth().GetHeadlessAuthentication(ctx, headlessID)
+				err := srv.Auth().UpsertHeadlessAuthenticationStub(ctx, username)
+				if err != nil {
+					errC <- err
+					return
+				}
+
+				headlessAuthn, err := srv.Auth().GetHeadlessAuthenticationFromWatcher(ctx, username, headlessID)
 				if err != nil {
 					errC <- err
 					return
@@ -854,7 +1220,7 @@ func TestServer_Authenticate_headless(t *testing.T) {
 				AuthenticateUserRequest: AuthenticateUserRequest{
 					// HeadlessAuthenticationID should take precedence over WebAuthn and OTP fields.
 					HeadlessAuthenticationID: headlessID,
-					Webauthn:                 &wanlib.CredentialAssertionResponse{},
+					Webauthn:                 &wantypes.CredentialAssertionResponse{},
 					OTP:                      &OTPCreds{},
 					Username:                 username,
 					PublicKey:                []byte(sshPubKey),
@@ -862,7 +1228,7 @@ func TestServer_Authenticate_headless(t *testing.T) {
 						RemoteAddr: "0.0.0.0",
 					},
 				},
-				TTL: defaults.CallbackTimeout,
+				TTL: defaults.HeadlessLoginTimeout,
 			})
 
 			// Use assert so that we also output any test failures below.
@@ -905,7 +1271,8 @@ func configureForMFA(t *testing.T, srv *TestTLSServer) *configureMFAResp {
 
 	authServer := srv.Auth()
 	ctx := context.Background()
-	require.NoError(t, authServer.SetAuthPreference(ctx, authPreference))
+	_, err = authServer.UpsertAuthPreference(ctx, authPreference)
+	require.NoError(t, err)
 
 	// Create user with a default password.
 	const username = "llama@goteleport.com"

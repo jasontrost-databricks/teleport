@@ -1,16 +1,20 @@
-// Copyright 2021 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -22,6 +26,8 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
@@ -30,6 +36,7 @@ import (
 	"github.com/gravitational/teleport/lib/auth/keystore"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend/memory"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/suite"
 )
@@ -41,7 +48,8 @@ func TestRemoteClusterStatus(t *testing.T) {
 
 	rc, err := types.NewRemoteCluster("rc")
 	require.NoError(t, err)
-	require.NoError(t, a.CreateRemoteCluster(rc))
+	rc, err = a.CreateRemoteCluster(ctx, rc)
+	require.NoError(t, err)
 
 	// This scenario deals with only one remote cluster, so it never hits the limit on status updates.
 	// TestRefreshRemoteClusters focuses on verifying the update limit logic.
@@ -50,10 +58,9 @@ func TestRemoteClusterStatus(t *testing.T) {
 	wantRC := rc
 	// Initially, no tunnels exist and status should be "offline".
 	wantRC.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
-	gotRC, err := a.GetRemoteCluster(rc.GetName())
-	gotRC.SetResourceID(0)
+	gotRC, err := a.GetRemoteCluster(ctx, rc.GetName())
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(rc, gotRC))
+	require.Empty(t, cmp.Diff(wantRC, gotRC, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")))
 
 	// Create several tunnel connections.
 	lastHeartbeat := a.clock.Now().UTC()
@@ -82,10 +89,9 @@ func TestRemoteClusterStatus(t *testing.T) {
 	// the latest tunnel heartbeat.
 	wantRC.SetConnectionStatus(teleport.RemoteClusterStatusOnline)
 	wantRC.SetLastHeartbeat(tc2.GetLastHeartbeat())
-	gotRC, err = a.GetRemoteCluster(rc.GetName())
+	gotRC, err = a.GetRemoteCluster(ctx, rc.GetName())
 	require.NoError(t, err)
-	gotRC.SetResourceID(0)
-	require.Empty(t, cmp.Diff(rc, gotRC))
+	require.Empty(t, cmp.Diff(rc, gotRC, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")))
 
 	// Delete the latest connection.
 	require.NoError(t, a.DeleteTunnelConnection(tc2.GetClusterName(), tc2.GetName()))
@@ -96,10 +102,9 @@ func TestRemoteClusterStatus(t *testing.T) {
 	// The last_heartbeat should remain the same, since tc1 has an older
 	// heartbeat.
 	wantRC.SetConnectionStatus(teleport.RemoteClusterStatusOnline)
-	gotRC, err = a.GetRemoteCluster(rc.GetName())
-	gotRC.SetResourceID(0)
+	gotRC, err = a.GetRemoteCluster(ctx, rc.GetName())
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(rc, gotRC))
+	require.Empty(t, cmp.Diff(rc, gotRC, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")))
 
 	// Delete the remaining connection
 	require.NoError(t, a.DeleteTunnelConnection(tc1.GetClusterName(), tc1.GetName()))
@@ -109,10 +114,9 @@ func TestRemoteClusterStatus(t *testing.T) {
 	// The status should switch to "offline".
 	// The last_heartbeat should remain the same.
 	wantRC.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
-	gotRC, err = a.GetRemoteCluster(rc.GetName())
-	gotRC.SetResourceID(0)
+	gotRC, err = a.GetRemoteCluster(ctx, rc.GetName())
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(rc, gotRC))
+	require.Empty(t, cmp.Diff(rc, gotRC, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")))
 }
 
 func TestRefreshRemoteClusters(t *testing.T) {
@@ -165,7 +169,8 @@ func TestRefreshRemoteClusters(t *testing.T) {
 				rc, err := types.NewRemoteCluster(fmt.Sprintf("rc-%03d", i))
 				rc.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
 				require.NoError(t, err)
-				require.NoError(t, a.CreateRemoteCluster(rc))
+				rc, err = a.CreateRemoteCluster(ctx, rc)
+				require.NoError(t, err)
 				allClusters[rc.GetName()] = rc
 
 				if i < tt.clustersNeedUpdate {
@@ -183,13 +188,13 @@ func TestRefreshRemoteClusters(t *testing.T) {
 
 			a.refreshRemoteClusters(ctx, rnd)
 
-			clusters, err := a.GetRemoteClusters()
+			clusters, err := a.GetRemoteClusters(ctx)
 			require.NoError(t, err)
 
 			var updated int
 			for _, cluster := range clusters {
 				old := allClusters[cluster.GetName()]
-				if cmp.Diff(old, cluster) != "" {
+				if cmp.Diff(old, cluster, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")) != "" {
 					updated++
 				}
 			}
@@ -327,7 +332,7 @@ func TestValidateTrustedCluster(t *testing.T) {
 			require.True(t, services.CertAuthoritiesEquivalent(localCA, returnedCA))
 		}
 
-		rcs, err := a.GetRemoteClusters()
+		rcs, err := a.GetRemoteClusters(ctx)
 		require.NoError(t, err)
 		require.Len(t, rcs, 1)
 		require.Equal(t, leafClusterCA.GetName(), rcs[0].GetName())
@@ -391,6 +396,21 @@ func TestValidateTrustedCluster(t *testing.T) {
 			[]types.CertAuthType{resp.CAs[0].GetType(), resp.CAs[1].GetType(), resp.CAs[2].GetType()},
 		)
 	})
+
+	t.Run("Cloud prohibits adding leaf clusters", func(t *testing.T) {
+		modules.SetTestModules(t, &modules.TestModules{
+			TestFeatures: modules.Features{Cloud: true},
+		})
+
+		req := &ValidateTrustedClusterRequest{
+			Token: "invalidtoken",
+			CAs:   []types.CertAuthority{},
+		}
+
+		server := ServerWithRoles{authServer: a}
+		_, err := server.ValidateTrustedCluster(ctx, req)
+		require.True(t, trace.IsNotImplemented(err), "ValidateTrustedCluster returned an unexpected error, got = %v (%T), want trace.NotImplementedError", err, err)
+	})
 }
 
 func newTestAuthServer(ctx context.Context, t *testing.T, name ...string) *Server {
@@ -422,54 +442,13 @@ func newTestAuthServer(ctx context.Context, t *testing.T, name ...string) *Serve
 	require.NoError(t, err)
 	t.Cleanup(func() { a.Close() })
 	require.NoError(t, a.SetClusterAuditConfig(ctx, types.DefaultClusterAuditConfig()))
-	require.NoError(t, a.SetClusterNetworkingConfig(ctx, types.DefaultClusterNetworkingConfig()))
-	require.NoError(t, a.SetSessionRecordingConfig(ctx, types.DefaultSessionRecordingConfig()))
-	require.NoError(t, a.SetAuthPreference(ctx, types.DefaultAuthPreference()))
+	_, err = a.UpsertClusterNetworkingConfig(ctx, types.DefaultClusterNetworkingConfig())
+	require.NoError(t, err)
+	_, err = a.UpsertSessionRecordingConfig(ctx, types.DefaultSessionRecordingConfig())
+	require.NoError(t, err)
+	_, err = a.UpsertAuthPreference(ctx, types.DefaultAuthPreference())
+	require.NoError(t, err)
 	return a
-}
-
-func TestRemoteDBCAMigration(t *testing.T) {
-	const (
-		localClusterName  = "localcluster"
-		remoteClusterName = "trustedcluster"
-	)
-	ctx := context.Background()
-
-	testAuth, err := NewTestAuthServer(TestAuthServerConfig{
-		ClusterName: localClusterName,
-		Dir:         t.TempDir(),
-	})
-	require.NoError(t, err)
-	a := testAuth.AuthServer
-
-	trustedCluster, err := types.NewTrustedCluster(remoteClusterName,
-		types.TrustedClusterSpecV2{Roles: []string{"nonempty"}})
-	require.NoError(t, err)
-	// use the UpsertTrustedCluster in Uncached as we just want the resource in
-	// the backend, we don't want to actually connect
-	_, err = a.Services.UpsertTrustedCluster(ctx, trustedCluster)
-	require.NoError(t, err)
-
-	// Generate remote HostCA and remove private key as remote CA should have only public cert.
-	remoteHostCA := suite.NewTestCA(types.HostCA, remoteClusterName)
-	types.RemoveCASecrets(remoteHostCA)
-
-	err = a.UpsertCertAuthority(ctx, remoteHostCA)
-	require.NoError(t, err)
-
-	// Run the migration
-	err = migrateDBAuthority(ctx, a)
-	require.NoError(t, err)
-
-	dbCAs, err := a.GetCertAuthority(context.Background(), types.CertAuthID{
-		Type:       types.DatabaseCA,
-		DomainName: remoteClusterName,
-	}, true)
-	require.NoError(t, err)
-	// Certificate should be copied.
-	require.Equal(t, remoteHostCA.Spec.ActiveKeys.TLS[0].Cert, dbCAs.GetActiveKeys().TLS[0].Cert)
-	// Private key should be empty.
-	require.Nil(t, dbCAs.GetActiveKeys().TLS[0].Key)
 }
 
 func TestUpsertTrustedCluster(t *testing.T) {
@@ -606,5 +585,21 @@ func TestUpsertTrustedCluster(t *testing.T) {
 		require.NoError(t, err)
 		_, err = a.UpsertTrustedCluster(ctx, trustedCluster)
 		require.NoError(t, err)
+	})
+	t.Run("Cloud prohibits being a leaf cluster", func(t *testing.T) {
+		modules.SetTestModules(t, &modules.TestModules{
+			TestFeatures: modules.Features{Cloud: true},
+		})
+
+		tc, err := types.NewTrustedCluster("test", types.TrustedClusterSpecV2{
+			RoleMap: []types.RoleMapping{
+				{Remote: teleport.PresetAccessRoleName, Local: []string{teleport.PresetAccessRoleName}},
+			},
+		})
+		require.NoError(t, err, "creating trusted cluster resource")
+
+		server := ServerWithRoles{authServer: a}
+		_, err = server.UpsertTrustedCluster(ctx, tc)
+		require.True(t, trace.IsNotImplemented(err), "UpsertTrustedCluster returned an unexpected error, got = %v (%T), want trace.NotImplementedError", err, err)
 	})
 }

@@ -1,34 +1,43 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package servicecfg
 
 import (
 	"fmt"
+	"io"
+	"log/slog"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/gravitational/trace"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/backend/lite"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/fixtures"
 	"github.com/gravitational/teleport/lib/srv/app/common"
 	"github.com/gravitational/teleport/lib/utils"
+	logutils "github.com/gravitational/teleport/lib/utils/log"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -50,16 +59,17 @@ func TestDefaultConfig(t *testing.T) {
 
 	// crypto settings
 	require.Equal(t, config.CipherSuites, utils.DefaultCipherSuites())
-	// Unfortunately the below algos don't have exported constants in
+	// Unfortunately, the below algos don't have exported constants in
 	// golang.org/x/crypto/ssh for us to use.
-	require.Equal(t, config.Ciphers, []string{
+	require.ElementsMatch(t, config.Ciphers, []string{
 		"aes128-gcm@openssh.com",
+		"aes256-gcm@openssh.com",
 		"chacha20-poly1305@openssh.com",
 		"aes128-ctr",
 		"aes192-ctr",
 		"aes256-ctr",
 	})
-	require.Equal(t, config.KEXAlgorithms, []string{
+	require.ElementsMatch(t, config.KEXAlgorithms, []string{
 		"curve25519-sha256",
 		"curve25519-sha256@libssh.org",
 		"ecdh-sha2-nistp256",
@@ -67,32 +77,34 @@ func TestDefaultConfig(t *testing.T) {
 		"ecdh-sha2-nistp521",
 		"diffie-hellman-group14-sha256",
 	})
-	require.Equal(t, config.MACAlgorithms, []string{
+	require.ElementsMatch(t, config.MACAlgorithms, []string{
 		"hmac-sha2-256-etm@openssh.com",
+		"hmac-sha2-512-etm@openssh.com",
 		"hmac-sha2-256",
+		"hmac-sha2-512",
 	})
 
 	// auth section
 	auth := config.Auth
-	require.Equal(t, auth.ListenAddr, localAuthAddr)
-	require.Equal(t, auth.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, auth.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
-	require.Equal(t, config.Auth.StorageConfig.Type, lite.GetName())
-	require.Equal(t, auth.StorageConfig.Params[defaults.BackendPath], filepath.Join(config.DataDir, defaults.BackendDir))
+	require.Equal(t, localAuthAddr, auth.ListenAddr)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), auth.Limiter.MaxConnections)
+	require.Equal(t, defaults.LimiterMaxConcurrentUsers, auth.Limiter.MaxNumberOfUsers)
+	require.Equal(t, lite.GetName(), config.Auth.StorageConfig.Type)
+	require.Equal(t, filepath.Join(config.DataDir, defaults.BackendDir), auth.StorageConfig.Params[defaults.BackendPath])
 
 	// SSH section
 	ssh := config.SSH
-	require.Equal(t, ssh.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, ssh.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
-	require.Equal(t, ssh.AllowTCPForwarding, true)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), ssh.Limiter.MaxConnections)
+	require.Equal(t, defaults.LimiterMaxConcurrentUsers, ssh.Limiter.MaxNumberOfUsers)
+	require.True(t, ssh.AllowTCPForwarding)
 
 	// proxy section
 	proxy := config.Proxy
-	require.Equal(t, proxy.Limiter.MaxConnections, int64(defaults.LimiterMaxConnections))
-	require.Equal(t, proxy.Limiter.MaxNumberOfUsers, defaults.LimiterMaxConcurrentUsers)
+	require.Equal(t, int64(defaults.LimiterMaxConnections), proxy.Limiter.MaxConnections)
+	require.Equal(t, defaults.LimiterMaxConcurrentUsers, proxy.Limiter.MaxNumberOfUsers)
 
 	// Misc levers and dials
-	require.Equal(t, config.RotationConnectionInterval, defaults.HighResPollingPeriod)
+	require.Equal(t, defaults.HighResPollingPeriod, config.RotationConnectionInterval)
 }
 
 // TestCheckApp validates application configuration.
@@ -255,7 +267,7 @@ func TestCheckDatabase(t *testing.T) {
 			inDatabase: Database{
 				Name:     "sqlserver",
 				Protocol: defaults.ProtocolSQLServer,
-				URI:      "localhost:1433",
+				URI:      "sqlserver.example.com:1433",
 				AD: DatabaseAD{
 					KeytabFile: "/etc/keytab",
 					Domain:     "test-domain",
@@ -476,23 +488,23 @@ func TestHostLabelMatching(t *testing.T) {
 
 func TestValidateConfig(t *testing.T) {
 	tests := []struct {
-		desc   string
-		config *Config
-		err    string
+		desc    string
+		config  *Config
+		wantErr string
 	}{
 		{
 			desc: "invalid version",
 			config: &Config{
 				Version: "v1.1",
 			},
-			err: fmt.Sprintf("version must be one of %s", strings.Join(defaults.TeleportConfigVersions, ", ")),
+			wantErr: fmt.Sprintf("version must be one of %s", strings.Join(defaults.TeleportConfigVersions, ", ")),
 		},
 		{
 			desc: "no service enabled",
 			config: &Config{
 				Version: defaults.TeleportConfigVersionV2,
 			},
-			err: "config: enable at least one of auth_service, ssh_service, proxy_service, app_service, database_service, kubernetes_service, windows_desktop_service, discovery_service, or okta_service",
+			wantErr: "config: enable at least one of auth_service, ssh_service, proxy_service, app_service, database_service, kubernetes_service, windows_desktop_service, discovery_service, okta_service ",
 		},
 		{
 			desc: "no auth_servers or proxy_server specified",
@@ -502,7 +514,7 @@ func TestValidateConfig(t *testing.T) {
 					Enabled: true,
 				},
 			},
-			err: "config: auth_server or proxy_server is required",
+			wantErr: "config: auth_server or proxy_server is required",
 		},
 		{
 			desc: "no auth_servers specified",
@@ -512,7 +524,7 @@ func TestValidateConfig(t *testing.T) {
 					Enabled: true,
 				},
 			},
-			err: "config: auth_servers is required",
+			wantErr: "config: auth_servers is required",
 		},
 		{
 			desc: "specifying proxy_server with the wrong config version",
@@ -523,7 +535,7 @@ func TestValidateConfig(t *testing.T) {
 				},
 				ProxyServer: *utils.MustParseAddr("0.0.0.0"),
 			},
-			err: "config: proxy_server is supported from config version v3 onwards",
+			wantErr: "config: proxy_server is supported from config version v3 onwards",
 		},
 		{
 			desc: "specifying auth_server when app_service is enabled",
@@ -535,7 +547,7 @@ func TestValidateConfig(t *testing.T) {
 				DataDir:     "/",
 				authServers: []utils.NetAddr{*utils.MustParseAddr("0.0.0.0")},
 			},
-			err: "config: when app_service is enabled, proxy_server must be specified instead of auth_server",
+			wantErr: "config: when app_service is enabled, proxy_server must be specified instead of auth_server",
 		},
 		{
 			desc: "specifying auth_server when db_service is enabled",
@@ -547,17 +559,17 @@ func TestValidateConfig(t *testing.T) {
 				DataDir:     "/",
 				authServers: []utils.NetAddr{*utils.MustParseAddr("0.0.0.0")},
 			},
-			err: "config: when db_service is enabled, proxy_server must be specified instead of auth_server",
+			wantErr: "config: when db_service is enabled, proxy_server must be specified instead of auth_server",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			err := ValidateConfig(test.config)
-			if test.err == "" {
+			if test.wantErr == "" {
 				require.NoError(t, err)
 			} else {
-				require.EqualError(t, err, test.err)
+				require.ErrorContains(t, err, test.wantErr)
 			}
 		})
 	}
@@ -615,10 +627,24 @@ func TestVerifyEnabledService(t *testing.T) {
 			errAssertionFunc: require.NoError,
 		},
 		{
+			desc: "jamf enabled",
+			config: &Config{
+				Jamf: JamfConfig{
+					Spec: &types.JamfSpecV1{
+						Enabled:     true,
+						ApiEndpoint: "https://example.jamfcloud.com",
+						Username:    "llama",
+						Password:    "supersecret!!1!ONE",
+					},
+				},
+			},
+			errAssertionFunc: require.NoError,
+		},
+		{
 			desc:   "nothing enabled",
 			config: &Config{},
-			errAssertionFunc: func(tt require.TestingT, err error, i ...interface{}) {
-				require.True(t, trace.IsBadParameter(err))
+			errAssertionFunc: func(t require.TestingT, err error, _ ...interface{}) {
+				require.True(t, trace.IsBadParameter(err), "err is not a BadParameter error: %T", err)
 			},
 		},
 	}
@@ -626,6 +652,93 @@ func TestVerifyEnabledService(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.desc, func(t *testing.T) {
 			test.errAssertionFunc(t, verifyEnabledService(test.config))
+		})
+	}
+}
+
+func TestWebPublicAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   ProxyConfig
+		expected string
+	}{
+		{
+			name:     "no public address specified",
+			expected: "https://<proxyhost>:3080",
+		},
+		{
+			name: "default port",
+			config: ProxyConfig{
+				PublicAddrs: []utils.NetAddr{
+					{Addr: "0.0.0.0", AddrNetwork: "tcp"},
+				},
+			},
+			expected: "https://0.0.0.0:3080",
+		},
+		{
+			name: "non-default port",
+			config: ProxyConfig{
+				PublicAddrs: []utils.NetAddr{
+					{Addr: "0.0.0.0:443", AddrNetwork: "tcp"},
+				},
+			},
+			expected: "https://0.0.0.0:443",
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			out, err := test.config.WebPublicAddr()
+			require.NoError(t, err)
+
+			require.Equal(t, test.expected, out)
+		})
+	}
+}
+
+func TestSetLogLevel(t *testing.T) {
+	for _, test := range []struct {
+		logLevel            slog.Level
+		expectedLogrusLevel logrus.Level
+	}{
+		{
+			logLevel:            logutils.TraceLevel,
+			expectedLogrusLevel: logrus.TraceLevel,
+		},
+		{
+			logLevel:            slog.LevelDebug,
+			expectedLogrusLevel: logrus.DebugLevel,
+		},
+		{
+			logLevel:            slog.LevelInfo,
+			expectedLogrusLevel: logrus.InfoLevel,
+		},
+		{
+			logLevel:            slog.LevelWarn,
+			expectedLogrusLevel: logrus.WarnLevel,
+		},
+		{
+			logLevel:            slog.LevelError,
+			expectedLogrusLevel: logrus.ErrorLevel,
+		},
+	} {
+		t.Run(test.logLevel.String(), func(t *testing.T) {
+			// Create a configuration with local loggers to avoid modifying the
+			// global instances.
+			c := &Config{
+				Log:    logrus.New(),
+				Logger: slog.New(logutils.NewSlogTextHandler(io.Discard, logutils.SlogTextHandlerConfig{})),
+			}
+			ApplyDefaults(c)
+
+			c.SetLogLevel(test.logLevel)
+			require.Equal(t, test.logLevel, c.LoggerLevel.Level())
+			require.IsType(t, &logrus.Logger{}, c.Log)
+			l, _ := c.Log.(*logrus.Logger)
+			require.Equal(t, test.expectedLogrusLevel, l.GetLevel())
 		})
 	}
 }

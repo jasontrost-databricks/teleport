@@ -1,18 +1,20 @@
 /*
-Copyright 2017 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -178,6 +180,7 @@ func (a *Server) UpsertTrustedCluster(ctx context.Context, trustedCluster types.
 		ResourceMetadata: apievents.ResourceMetadata{
 			Name: trustedCluster.GetName(),
 		},
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
 	}); err != nil {
 		logger.WithError(err).Warn("Failed to emit trusted cluster create event.")
 	}
@@ -246,6 +249,7 @@ func (a *Server) DeleteTrustedCluster(ctx context.Context, name string) error {
 		ResourceMetadata: apievents.ResourceMetadata{
 			Name: name,
 		},
+		ConnectionMetadata: authz.ConnectionMetadata(ctx),
 	}); err != nil {
 		log.WithError(err).Warn("Failed to emit trusted cluster delete event.")
 	}
@@ -349,7 +353,7 @@ func (a *Server) addCertAuthorities(ctx context.Context, trustedCluster types.Tr
 func (a *Server) DeleteRemoteCluster(ctx context.Context, clusterName string) error {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
-	_, err := a.GetRemoteCluster(clusterName)
+	_, err := a.GetRemoteCluster(ctx, clusterName)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -381,10 +385,10 @@ func (a *Server) DeleteRemoteCluster(ctx context.Context, clusterName string) er
 }
 
 // GetRemoteCluster returns remote cluster by name
-func (a *Server) GetRemoteCluster(clusterName string) (types.RemoteCluster, error) {
+func (a *Server) GetRemoteCluster(ctx context.Context, clusterName string) (types.RemoteCluster, error) {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
-	remoteCluster, err := a.Services.GetRemoteCluster(clusterName)
+	remoteCluster, err := a.Services.GetRemoteCluster(ctx, clusterName)
 	return remoteCluster, trace.Wrap(err)
 }
 
@@ -408,7 +412,8 @@ func (a *Server) updateRemoteClusterStatus(ctx context.Context, netConfig types.
 		// wasn't already).
 		if remoteCluster.GetConnectionStatus() != teleport.RemoteClusterStatusOffline {
 			remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
-			if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+			_, err := a.UpdateRemoteCluster(ctx, remoteCluster)
+			if err != nil {
 				// if the cluster was concurrently updated, ignore the update.  either
 				// the update was consistent with our view of the world, in which case
 				// retrying would be pointless, or the update was not consistent, in which
@@ -436,7 +441,8 @@ func (a *Server) updateRemoteClusterStatus(ctx context.Context, netConfig types.
 		remoteCluster.SetLastHeartbeat(lastConn.GetLastHeartbeat().UTC())
 	}
 	if prevConnectionStatus != remoteCluster.GetConnectionStatus() || !prevLastHeartbeat.Equal(remoteCluster.GetLastHeartbeat()) {
-		if err := a.UpdateRemoteCluster(ctx, remoteCluster); err != nil {
+		_, err := a.UpdateRemoteCluster(ctx, remoteCluster)
+		if err != nil {
 			// if the cluster was concurrently updated, ignore the update.  either
 			// the update was consistent with our view of the world, in which case
 			// retrying would be pointless, or the update was not consistent, in which
@@ -453,10 +459,10 @@ func (a *Server) updateRemoteClusterStatus(ctx context.Context, netConfig types.
 }
 
 // GetRemoteClusters returns remote clusters with updated statuses
-func (a *Server) GetRemoteClusters(opts ...services.MarshalOption) ([]types.RemoteCluster, error) {
+func (a *Server) GetRemoteClusters(ctx context.Context) ([]types.RemoteCluster, error) {
 	// To make sure remote cluster exists - to protect against random
 	// clusterName requests (e.g. when clusterName is set to local cluster name)
-	remoteClusters, err := a.Services.GetRemoteClusters(opts...)
+	remoteClusters, err := a.Services.GetRemoteClusters(ctx)
 	return remoteClusters, trace.Wrap(err)
 }
 
@@ -484,8 +490,8 @@ func (a *Server) validateTrustedCluster(ctx context.Context, validateRequest *Va
 		return nil, trace.AccessDenied("expected exactly one certificate authority, received %v", len(validateRequest.CAs))
 	}
 	remoteCA := validateRequest.CAs[0]
-	err = remoteCA.CheckAndSetDefaults()
-	if err != nil {
+
+	if err := services.CheckAndSetDefaults(remoteCA); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -519,7 +525,7 @@ func (a *Server) validateTrustedCluster(ctx context.Context, validateRequest *Va
 	}
 	remoteCluster.SetConnectionStatus(teleport.RemoteClusterStatusOffline)
 
-	err = a.CreateRemoteCluster(remoteCluster)
+	_, err = a.CreateRemoteCluster(ctx, remoteCluster)
 	if err != nil {
 		if !trace.IsAlreadyExists(err) {
 			return nil, trace.Wrap(err)
@@ -654,7 +660,7 @@ func (a *Server) sendValidateRequestToProxy(host string, validateRequest *Valida
 		return nil, trace.Wrap(err)
 	}
 
-	var validateResponseRaw *ValidateTrustedClusterResponseRaw
+	var validateResponseRaw ValidateTrustedClusterResponseRaw
 	err = json.Unmarshal(out.Bytes(), &validateResponseRaw)
 	if err != nil {
 		return nil, trace.Wrap(err)

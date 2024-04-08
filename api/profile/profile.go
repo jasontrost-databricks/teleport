@@ -71,9 +71,6 @@ type Profile struct {
 	// SiteName is equivalent to the --cluster flag
 	SiteName string `yaml:"cluster,omitempty"`
 
-	// ForwardedPorts is the list of ports to forward to the target node.
-	ForwardedPorts []string `yaml:"forward_ports,omitempty"`
-
 	// DynamicForwardedPorts is a list of ports to use for dynamic port
 	// forwarding (SOCKS5).
 	DynamicForwardedPorts []string `yaml:"dynamic_forward_ports,omitempty"`
@@ -106,6 +103,13 @@ type Profile struct {
 
 	// PrivateKeyPolicy is a key policy enforced for this profile.
 	PrivateKeyPolicy keys.PrivateKeyPolicy `yaml:"private_key_policy"`
+
+	// PIVSlot is a specific piv slot that Teleport clients should use for hardware key support.
+	PIVSlot keys.PIVSlot `yaml:"piv_slot"`
+
+	// MissingClusterDetails means this profile was created with limited cluster details.
+	// Missing cluster details should be loaded into the profile by pinging the proxy.
+	MissingClusterDetails bool
 }
 
 // Copy returns a shallow copy of p, or nil if p is nil.
@@ -143,6 +147,12 @@ func (p *Profile) TLSConfig() (*tls.Config, error) {
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      pool,
 	}, nil
+}
+
+// RequireKubeLocalProxy returns true if this profile indicates a local proxy
+// is required for kube access.
+func (p *Profile) RequireKubeLocalProxy() bool {
+	return p.KubeProxyAddr == p.WebProxyAddr && p.TLSRoutingConnUpgradeRequired
 }
 
 func certPoolFromProfile(p *Profile) (*x509.CertPool, error) {
@@ -238,7 +248,7 @@ func SetCurrentProfileName(dir string, name string) error {
 	}
 
 	path := keypaths.CurrentProfileFilePath(dir)
-	if err := os.WriteFile(path, []byte(strings.TrimSpace(name)+"\n"), 0660); err != nil {
+	if err := os.WriteFile(path, []byte(strings.TrimSpace(name)+"\n"), 0o660); err != nil {
 		return trace.Wrap(err)
 	}
 	return nil
@@ -313,7 +323,15 @@ func FullProfilePath(dir string) string {
 
 // defaultProfilePath retrieves the default path of the TSH profile.
 func defaultProfilePath() string {
-	home := os.TempDir()
+	// start with UserHomeDir, which is the fastest option as it
+	// relies only on environment variables and does not perform
+	// a user lookup (which can be very slow on large AD environments)
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return filepath.Join(home, profileDir)
+	}
+
+	home = os.TempDir()
 	if u, err := utils.CurrentUser(); err == nil && u.HomeDir != "" {
 		home = u.HomeDir
 	}
@@ -345,10 +363,15 @@ func profileFromFile(filePath string) (*Profile, error) {
 	if err != nil {
 		return nil, trace.ConvertSystemError(err)
 	}
-	var p *Profile
+	var p Profile
 	if err := yaml.Unmarshal(bytes, &p); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	if p.Name() == "" {
+		return nil, trace.NotFound("invalid or empty profile at %q", filePath)
+	}
+
 	p.Dir = filepath.Dir(filePath)
 
 	// Older versions of tsh did not always store the cluster name in the
@@ -357,7 +380,7 @@ func profileFromFile(filePath string) (*Profile, error) {
 	if p.SiteName == "" {
 		p.SiteName = p.Name()
 	}
-	return p, nil
+	return &p, nil
 }
 
 // SaveToDir saves this profile to the specified directory.
@@ -381,7 +404,7 @@ func (p *Profile) saveToFile(filepath string) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if err = os.WriteFile(filepath, bytes, 0660); err != nil {
+	if err = os.WriteFile(filepath, bytes, 0o660); err != nil {
 		return trace.Wrap(err)
 	}
 	return nil

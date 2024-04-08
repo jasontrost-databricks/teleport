@@ -1,18 +1,20 @@
 /*
-Copyright 2017-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -27,13 +29,17 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/pquerna/otp/totp"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/constants"
+	mfav1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/mfa/v1"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
+	wanpb "github.com/gravitational/teleport/api/types/webauthn"
 	"github.com/gravitational/teleport/lib/auth/keystore"
 	authority "github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/backend"
@@ -43,12 +49,13 @@ import (
 	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/suite"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 type passwordSuite struct {
 	bk          backend.Backend
 	a           *Server
-	mockEmitter *eventstest.MockEmitter
+	mockEmitter *eventstest.MockRecorderEmitter
 }
 
 func setupPasswordSuite(t *testing.T) *passwordSuite {
@@ -87,6 +94,16 @@ func setupPasswordSuite(t *testing.T) *passwordSuite {
 	err = s.a.SetClusterName(clusterName)
 	require.NoError(t, err)
 
+	// set lock watcher
+	lockWatcher, err := services.NewLockWatcher(ctx, services.LockWatcherConfig{
+		ResourceWatcherConfig: services.ResourceWatcherConfig{
+			Component: teleport.ComponentAuth,
+			Client:    s.a,
+		},
+	})
+	require.NoError(t, err, "NewLockWatcher")
+	s.a.SetLockWatcher(lockWatcher)
+
 	// set static tokens
 	staticTokens, err := types.NewStaticTokens(types.StaticTokensSpecV2{
 		StaticTokens: []types.ProvisionTokenV1{},
@@ -95,7 +112,7 @@ func setupPasswordSuite(t *testing.T) *passwordSuite {
 	err = s.a.SetStaticTokens(staticTokens)
 	require.NoError(t, err)
 
-	s.mockEmitter = &eventstest.MockEmitter{}
+	s.mockEmitter = &eventstest.MockRecorderEmitter{}
 	s.a.emitter = s.mockEmitter
 	return &s
 }
@@ -105,7 +122,7 @@ func TestUserNotFound(t *testing.T) {
 
 	s := setupPasswordSuite(t)
 	username := "unknown-user"
-	password := "barbaz"
+	password := "feefiefoefum"
 
 	err := s.a.checkPasswordWOToken(username, []byte(password))
 	require.Error(t, err)
@@ -113,17 +130,49 @@ func TestUserNotFound(t *testing.T) {
 	require.True(t, trace.IsBadParameter(err))
 }
 
+func TestPasswordLengthChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	srv := newTestTLSServer(t)
+	authServer := srv.Auth()
+
+	ap, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
+		Type:         constants.Local,
+		SecondFactor: constants.SecondFactorOff,
+	})
+	require.NoError(t, err)
+
+	_, err = authServer.UpsertAuthPreference(ctx, ap)
+	require.NoError(t, err)
+
+	username := fmt.Sprintf("llama%v@goteleport.com", rand.Int())
+	password := []byte("a")
+	_, _, err = CreateUserAndRole(authServer, username, []string{username}, nil)
+	require.NoError(t, err)
+
+	hash, err := utils.BcryptFromPassword(password, bcrypt.DefaultCost)
+	require.NoError(t, err)
+
+	// Set an initial password that is shorter than minimum length
+	err = authServer.UpsertPasswordHash(username, hash)
+	require.NoError(t, err)
+
+	// Ensure that a shorter password still works for auth
+	err = authServer.checkPasswordWOToken(username, password)
+	require.NoError(t, err)
+}
+
 func TestChangePassword(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
 	s := setupPasswordSuite(t)
-	req, err := s.prepareForPasswordChange("user1", []byte("abc123"), constants.SecondFactorOff)
+	req, err := s.prepareForPasswordChange("user1", []byte("abcdef123456"), constants.SecondFactorOff)
 	require.NoError(t, err)
 
 	fakeClock := clockwork.NewFakeClock()
 	s.a.SetClock(fakeClock)
-	req.NewPassword = []byte("abce456")
+	req.NewPassword = []byte("defceba654321")
 
 	err = s.a.ChangePassword(ctx, req)
 	require.NoError(t, err)
@@ -134,7 +183,7 @@ func TestChangePassword(t *testing.T) {
 	// advance time and make sure we can login again
 	fakeClock.Advance(defaults.AccountLockInterval + time.Second)
 	req.OldPassword = req.NewPassword
-	req.NewPassword = []byte("abc5555")
+	req.NewPassword = []byte("123456abcdef")
 	err = s.a.ChangePassword(ctx, req)
 	require.NoError(t, err)
 }
@@ -143,7 +192,7 @@ func TestChangePasswordWithOTP(t *testing.T) {
 	t.Parallel()
 
 	s := setupPasswordSuite(t)
-	req, err := s.prepareForPasswordChange("user2", []byte("abc123"), constants.SecondFactorOTP)
+	req, err := s.prepareForPasswordChange("user2", []byte("abcdef123456"), constants.SecondFactorOTP)
 	require.NoError(t, err)
 
 	fakeClock := clockwork.NewFakeClock()
@@ -160,7 +209,7 @@ func TestChangePasswordWithOTP(t *testing.T) {
 	require.NoError(t, err)
 
 	// change password
-	req.NewPassword = []byte("abce456")
+	req.NewPassword = []byte("defceba654321")
 	req.SecondFactorToken = validToken
 	err = s.a.ChangePassword(ctx, req)
 	require.NoError(t, err)
@@ -172,7 +221,7 @@ func TestChangePasswordWithOTP(t *testing.T) {
 
 	validToken, _ = totp.GenerateCode(otpSecret, s.a.GetClock().Now())
 	req.OldPassword = req.NewPassword
-	req.NewPassword = []byte("abc5555")
+	req.NewPassword = []byte("123456abcdef")
 	req.SecondFactorToken = validToken
 	err = s.a.ChangePassword(ctx, req)
 	require.NoError(t, err)
@@ -186,41 +235,108 @@ func TestServer_ChangePassword(t *testing.T) {
 	mfa := configureForMFA(t, srv)
 	username := mfa.User
 	password := mfa.Password
+	userClient, err := srv.NewClient(TestUser(username))
+	require.NoError(t, err)
+	passwordlessDev, err := RegisterTestDevice(
+		context.Background(),
+		userClient,
+		"passwordless-1",
+		proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+		mfa.TOTPDev,
+		WithPasswordless())
+	require.NoError(t, err)
 
 	tests := []struct {
-		name    string
-		newPass string
-		device  *TestDevice
+		name             string
+		oldPass          string
+		newPass          string
+		device           *TestDevice
+		challengeRequest *proto.CreateAuthenticateChallengeRequest
 	}{
 		{
 			name:    "OK TOTP-based change",
+			oldPass: password,
 			newPass: "llamasarecool11",
 			device:  mfa.TOTPDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
+		},
+		{
+			name:    "OK TOTP-based change (legacy flow)",
+			oldPass: "llamasarecool11",
+			newPass: "llamasarecool12",
+			device:  mfa.TOTPDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{
+					UserCredentials: &proto.UserCredentials{
+						Username: username,
+						Password: []byte("llamasarecool11"),
+					},
+				},
+			},
 		},
 		{
 			name:    "OK Webauthn-based change",
+			oldPass: "llamasarecool12",
 			newPass: "llamasarecool13",
 			device:  mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
+		},
+		{
+			name:    "OK with verification explicitly set to discouraged",
+			oldPass: "llamasarecool13",
+			newPass: "llamasarecool14",
+			device:  mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					UserVerificationRequirement: "discouraged",
+					Scope:                       mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
+		},
+		{
+			name:    "OK passwordless change",
+			oldPass: "",
+			newPass: "llamasarecool15",
+			device:  passwordlessDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					UserVerificationRequirement: "required",
+					Scope:                       mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
 		},
 	}
 
 	authServer := srv.Auth()
 	ctx := context.Background()
 
-	oldPass := []byte(password)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			oldPass := []byte(test.oldPass)
 			newPass := []byte(test.newPass)
 
 			// Acquire and solve an MFA challenge.
-			mfaChallenge, err := authServer.CreateAuthenticateChallenge(ctx, &proto.CreateAuthenticateChallengeRequest{
-				Request: &proto.CreateAuthenticateChallengeRequest_UserCredentials{
-					UserCredentials: &proto.UserCredentials{
-						Username: username,
-						Password: oldPass,
-					},
-				},
-			})
+			mfaChallenge, err := userClient.CreateAuthenticateChallenge(ctx, test.challengeRequest)
 			require.NoError(t, err, "creating challenge")
 			mfaResp, err := test.device.SolveAuthn(mfaChallenge)
 			require.NoError(t, err, "solving challenge with device")
@@ -237,12 +353,130 @@ func TestServer_ChangePassword(t *testing.T) {
 			case mfaResp.GetWebauthn() != nil:
 				req.Webauthn = mfaResp.GetWebauthn()
 			}
-			require.NoError(t, authServer.ChangePassword(ctx, req), "changing password")
+			require.NoError(t, userClient.ChangePassword(ctx, req), "changing password")
 
 			// Did the password change take effect?
 			require.NoError(t, authServer.checkPasswordWOToken(username, newPass), "password change didn't take effect")
+		})
+	}
+}
 
-			oldPass = newPass // Set for next iteration.
+// This test asserts that an attacker is unable to change password without
+// providing the old one if they take over a user's web session and use a
+// different type of WebAuthn challenge that would be normally requested by the
+// Web UI. This is a regression test for
+// https://github.com/gravitational/teleport-private/issues/1369.
+func TestServer_ChangePassword_Fails(t *testing.T) {
+	t.Parallel()
+
+	server := newTestTLSServer(t)
+	mfa := configureForMFA(t, server)
+	authServer := server.Auth()
+	ctx := context.Background()
+	username := mfa.User
+	password := mfa.Password
+
+	tests := []struct {
+		name             string
+		oldPass          string
+		device           *TestDevice
+		challengeRequest *proto.CreateAuthenticateChallengeRequest
+	}{
+		{
+			name:    "No old password, TOTP challenge",
+			oldPass: "",
+			device:  mfa.TOTPDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					AllowReuse: mfav1.ChallengeAllowReuse_CHALLENGE_ALLOW_REUSE_NO,
+					Scope:      mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
+		},
+		{
+			name:    "No old password, WebAuthn challenge",
+			oldPass: "",
+			device:  mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					AllowReuse: mfav1.ChallengeAllowReuse_CHALLENGE_ALLOW_REUSE_NO,
+					Scope:      mfav1.ChallengeScope_CHALLENGE_SCOPE_CHANGE_PASSWORD,
+				},
+			},
+		},
+		{
+			name:             "Empty challenge request",
+			oldPass:          password,
+			device:           mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{},
+		},
+		{
+			name:    "Unspecified challenge scope",
+			oldPass: password,
+			device:  mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{},
+			},
+		},
+		{
+			name:    "Illegal challenge scope",
+			oldPass: password,
+			device:  mfa.WebDev,
+			challengeRequest: &proto.CreateAuthenticateChallengeRequest{
+				Request: &proto.CreateAuthenticateChallengeRequest_ContextUser{
+					ContextUser: &proto.ContextUser{},
+				},
+				ChallengeExtensions: &mfav1.ChallengeExtensions{
+					Scope: mfav1.ChallengeScope_CHALLENGE_SCOPE_LOGIN,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			newPass := []byte("capybarasarecool123")
+			oldPass := []byte(test.oldPass)
+
+			userClient, err := server.NewClient(TestUser(username))
+			require.NoError(t, err)
+			defer userClient.Close()
+
+			// Acquire and solve an MFA challenge.
+			mfaChallenge, err := userClient.CreateAuthenticateChallenge(ctx, test.challengeRequest)
+			require.NoError(t, err, "creating challenge")
+			mfaResp, err := test.device.SolveAuthn(mfaChallenge)
+			require.NoError(t, err, "solving challenge with device")
+
+			// Change password.
+			req := &proto.ChangePasswordRequest{
+				User:        username,
+				OldPassword: oldPass,
+				NewPassword: newPass,
+			}
+			switch {
+			case mfaResp.GetTOTP() != nil:
+				req.SecondFactorToken = mfaResp.GetTOTP().Code
+			case mfaResp.GetWebauthn() != nil:
+				req.Webauthn = mfaResp.GetWebauthn()
+			}
+			err = userClient.ChangePassword(ctx, req)
+			assert.True(t,
+				trace.IsAccessDenied(err),
+				"ChangePassword error mismatch, want=AccessDenied, got=%v (%T)",
+				err, trace.Unwrap(err))
+
+			// Did the password change take effect?
+			assert.Error(t, authServer.checkPasswordWOToken(username, newPass), "password was changed")
 		})
 	}
 }
@@ -250,76 +484,78 @@ func TestServer_ChangePassword(t *testing.T) {
 func TestChangeUserAuthentication(t *testing.T) {
 	t.Parallel()
 
-	srv := newTestTLSServer(t)
+	testServer := newTestTLSServer(t)
+	authServer := testServer.Auth()
+	clock := testServer.Clock()
 	ctx := context.Background()
 
 	tests := []struct {
 		name              string
-		setAuthPreference func()
-		getReq            func(string) *proto.ChangeUserAuthenticationRequest
-		getInvalidReq     func(string) *proto.ChangeUserAuthenticationRequest
+		setAuthPreference func(t *testing.T)
+		getReq            func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest
+		getInvalidReq     func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest
 	}{
 		{
 			name: "with second factor off and password only",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorOff,
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:     resetTokenID,
-					NewPassword: []byte("password1"),
+					NewPassword: []byte("password1357"),
 				}
 			},
 		},
 		{
 			name: "with second factor otp",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorOTP,
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
-				res, err := srv.Auth().CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+				registerChal, err := authServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
 					TokenID:    resetTokenID,
 					DeviceType: proto.DeviceType_DEVICE_TYPE_TOTP,
 				})
-				require.NoError(t, err)
+				require.NoError(t, err, "CreateRegisterChallenge")
 
-				otpToken, err := totp.GenerateCode(res.GetTOTP().GetSecret(), srv.Clock().Now())
-				require.NoError(t, err)
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal, WithTestDeviceClock(clock))
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.ChangeUserAuthenticationRequest{
-					TokenID:     resetTokenID,
-					NewPassword: []byte("password2"),
-					NewMFARegisterResponse: &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_TOTP{
-						TOTP: &proto.TOTPRegisterResponse{Code: otpToken},
-					}},
+					TokenID:                resetTokenID,
+					NewPassword:            []byte("password2468"),
+					NewMFARegisterResponse: registerSolved,
 				}
 			},
 			// Invalid MFA fields when auth settings set to only otp.
-			getInvalidReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getInvalidReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:     resetTokenID,
-					NewPassword: []byte("password2"),
-					NewMFARegisterResponse: &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_Webauthn{
-						Webauthn: &wantypes.CredentialCreationResponse{},
-					}},
+					NewPassword: []byte("password2468"),
+					NewMFARegisterResponse: &proto.MFARegisterResponse{
+						Response: &proto.MFARegisterResponse_Webauthn{
+							Webauthn: &wanpb.CredentialCreationResponse{},
+						},
+					},
 				}
 			},
 		},
 		{
 			name: "with second factor webauthn",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorWebauthn,
@@ -328,31 +564,40 @@ func TestChangeUserAuthentication(t *testing.T) {
 					},
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
-				_, webauthnRegRes, err := getMockedWebauthnAndRegisterRes(srv.Auth(), resetTokenID, proto.DeviceUsage_DEVICE_USAGE_MFA)
-				require.NoError(t, err)
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+				registerChal, err := authServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     resetTokenID,
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:                resetTokenID,
-					NewPassword:            []byte("password3"),
-					NewMFARegisterResponse: webauthnRegRes,
+					NewPassword:            []byte("password3579"),
+					NewMFARegisterResponse: registerSolved,
 				}
 			},
 			// Invalid totp fields when auth settings set to only webauthn.
-			getInvalidReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getInvalidReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
-					TokenID:                resetTokenID,
-					NewPassword:            []byte("password3"),
-					NewMFARegisterResponse: &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_TOTP{}},
+					TokenID:     resetTokenID,
+					NewPassword: []byte("password3579"),
+					NewMFARegisterResponse: &proto.MFARegisterResponse{
+						Response: &proto.MFARegisterResponse_TOTP{},
+					},
 				}
 			},
 		},
 		{
 			name: "with passwordless",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorWebauthn,
@@ -361,29 +606,38 @@ func TestChangeUserAuthentication(t *testing.T) {
 					},
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
-				_, webauthnRes, err := getMockedWebauthnAndRegisterRes(srv.Auth(), resetTokenID, proto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS)
-				require.NoError(t, err)
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+				registerChal, err := authServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     resetTokenID,
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_PASSWORDLESS,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal, WithPasswordless())
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:                resetTokenID,
-					NewMFARegisterResponse: webauthnRes,
+					NewMFARegisterResponse: registerSolved,
 				}
 			},
 			// Missing webauthn for passwordless.
-			getInvalidReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getInvalidReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
-					TokenID:                resetTokenID,
-					NewMFARegisterResponse: &proto.MFARegisterResponse{Response: &proto.MFARegisterResponse_TOTP{}},
+					TokenID: resetTokenID,
+					NewMFARegisterResponse: &proto.MFARegisterResponse{
+						Response: &proto.MFARegisterResponse_TOTP{},
+					},
 				}
 			},
 		},
 		{
 			name: "with second factor on",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorOn,
@@ -392,31 +646,38 @@ func TestChangeUserAuthentication(t *testing.T) {
 					},
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
-				_, mfaResp, err := getMockedWebauthnAndRegisterRes(srv.Auth(), resetTokenID, proto.DeviceUsage_DEVICE_USAGE_MFA)
-				require.NoError(t, err)
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+				registerChal, err := authServer.CreateRegisterChallenge(ctx, &proto.CreateRegisterChallengeRequest{
+					TokenID:     resetTokenID,
+					DeviceType:  proto.DeviceType_DEVICE_TYPE_WEBAUTHN,
+					DeviceUsage: proto.DeviceUsage_DEVICE_USAGE_MFA,
+				})
+				require.NoError(t, err, "CreateRegisterChallenge")
+
+				_, registerSolved, err := NewTestDeviceFromChallenge(registerChal)
+				require.NoError(t, err, "NewTestDeviceFromChallenge")
 
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:                resetTokenID,
-					NewPassword:            []byte("password4"),
-					NewMFARegisterResponse: mfaResp,
+					NewPassword:            []byte("password4680"),
+					NewMFARegisterResponse: registerSolved,
 					NewDeviceName:          "new-device",
 				}
 			},
 			// Empty register response, when auth settings requires second factors.
-			getInvalidReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getInvalidReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:     resetTokenID,
-					NewPassword: []byte("password4"),
+					NewPassword: []byte("password4680"),
 				}
 			},
 		},
 		{
 			name: "with second factor optional and no second factor",
-			setAuthPreference: func() {
+			setAuthPreference: func(t *testing.T) {
 				authPreference, err := types.NewAuthPreference(types.AuthPreferenceSpecV2{
 					Type:         constants.Local,
 					SecondFactor: constants.SecondFactorOptional,
@@ -425,50 +686,50 @@ func TestChangeUserAuthentication(t *testing.T) {
 					},
 				})
 				require.NoError(t, err)
-				err = srv.Auth().SetAuthPreference(ctx, authPreference)
+				_, err = authServer.UpsertAuthPreference(ctx, authPreference)
 				require.NoError(t, err)
 			},
-			getReq: func(resetTokenID string) *proto.ChangeUserAuthenticationRequest {
+			getReq: func(t *testing.T, resetTokenID string) *proto.ChangeUserAuthenticationRequest {
 				return &proto.ChangeUserAuthenticationRequest{
 					TokenID:     resetTokenID,
-					NewPassword: []byte("password5"),
+					NewPassword: []byte("password5791"),
 				}
 			},
 		},
 	}
-
 	for _, c := range tests {
 		t.Run(c.name, func(t *testing.T) {
 			username := fmt.Sprintf("llama%v@goteleport.com", rand.Int())
-			_, _, err := CreateUserAndRole(srv.Auth(), username, []string{username}, nil)
+			_, _, err := CreateUserAndRole(authServer, username, []string{username}, nil)
 			require.NoError(t, err)
 
-			c.setAuthPreference()
+			c.setAuthPreference(t)
 
-			token, err := srv.Auth().CreateResetPasswordToken(ctx, CreateUserTokenRequest{
+			resetToken, err := authServer.CreateResetPasswordToken(ctx, CreateUserTokenRequest{
 				Name: username,
 			})
 			require.NoError(t, err)
+			token := resetToken.GetName()
 
 			if c.getInvalidReq != nil {
-				invalidReq := c.getInvalidReq(token.GetName())
-				_, err := srv.Auth().changeUserAuthentication(ctx, invalidReq)
+				invalidReq := c.getInvalidReq(t, token)
+				_, err := authServer.changeUserAuthentication(ctx, invalidReq)
 				require.True(t, trace.IsBadParameter(err))
 			}
 
-			validReq := c.getReq(token.GetName())
-			_, err = srv.Auth().changeUserAuthentication(ctx, validReq)
+			validReq := c.getReq(t, token)
+			_, err = authServer.changeUserAuthentication(ctx, validReq)
 			require.NoError(t, err)
 
 			// Test password is updated.
 			if len(validReq.NewPassword) != 0 {
-				err := srv.Auth().checkPasswordWOToken(username, validReq.NewPassword)
+				err := authServer.checkPasswordWOToken(username, validReq.NewPassword)
 				require.NoError(t, err)
 			}
 
 			// Test device was registered.
 			if validReq.NewMFARegisterResponse != nil {
-				devs, err := srv.Auth().Services.GetMFADevices(ctx, username, false /* without secrets*/)
+				devs, err := authServer.Services.GetMFADevices(ctx, username, false /* without secrets*/)
 				require.NoError(t, err)
 				require.Len(t, devs, 1)
 
@@ -509,7 +770,7 @@ func TestChangeUserAuthenticationWithErrors(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	validPassword := []byte("qweQWE1")
+	validPassword := []byte("qwertyQWERTY1")
 	validTokenID := token.GetName()
 
 	type testCase struct {
@@ -559,7 +820,7 @@ func TestChangeUserAuthenticationWithErrors(t *testing.T) {
 	for _, tc := range testCases {
 		// set new auth preference settings
 		authPreference.SetSecondFactor(tc.secondFactor)
-		err = s.a.SetAuthPreference(ctx, authPreference)
+		authPreference, err = s.a.UpsertAuthPreference(ctx, authPreference)
 		require.NoError(t, err)
 
 		_, err = s.a.changeUserAuthentication(ctx, tc.req)
@@ -567,7 +828,7 @@ func TestChangeUserAuthenticationWithErrors(t *testing.T) {
 	}
 
 	authPreference.SetSecondFactor(constants.SecondFactorOff)
-	err = s.a.SetAuthPreference(ctx, authPreference)
+	_, err = s.a.UpsertAuthPreference(ctx, authPreference)
 	require.NoError(t, err)
 
 	_, err = s.a.changeUserAuthentication(ctx, &proto.ChangeUserAuthenticationRequest{
@@ -624,7 +885,7 @@ func (s *passwordSuite) prepareForPasswordChange(user string, pass []byte, secon
 		return req, err
 	}
 
-	err = s.a.SetAuthPreference(ctx, ap)
+	_, err = s.a.UpsertAuthPreference(ctx, ap)
 	if err != nil {
 		return req, err
 	}

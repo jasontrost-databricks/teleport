@@ -16,8 +16,8 @@ users and permission to manage the passwords in AWS Secrets Manager.
 
 You can generate and manage the permissions with the [`teleport db configure
 bootstrap`](../../database-access/reference/cli.mdx#teleport-db-configure-bootstrap)
-command. For example, the following command would generate and print the
-IAM policies:
+command. For example, the following command would generate and print the IAM
+policies:
 
 ```code
 $ teleport db configure bootstrap --manual
@@ -155,7 +155,7 @@ policies for each discovery type are shown below.
 </Tabs>
 
 <Admonition type="note">
-Teleport uses `rds:ModifyDBInstance` and `rds:DescribeDBClusters` to
+Teleport uses `rds:ModifyDBInstance` and `rds:ModifyDBCluster` to
 automatically enable [IAM
 authentication](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
 on the RDS instance and the Aurora cluster, respectively. You can omit these
@@ -180,7 +180,6 @@ permissions if IAM authentication is already enabled.
               "Action": [
                   "rds:DescribeDBProxies",
                   "rds:DescribeDBProxyEndpoints",
-                  "rds:DescribeDBProxyTargets",
                   "rds:ListTagsForResource",
               ],
               "Resource": "*"
@@ -213,7 +212,6 @@ permissions if IAM authentication is already enabled.
               "Action": [
                   "rds:DescribeDBProxies",
                   "rds:DescribeDBProxyEndpoints",
-                  "rds:DescribeDBProxyTargets",
                   "rds:ListTagsForResource",
               ],
               "Resource": "*"
@@ -399,7 +397,7 @@ IAM policies with the required permissions are shown below.
 To connect to an RDS database, the Database Service instance's IAM identity
 needs to have `rds-db:connect` permissions for it:
 
-<Details title="Example IAM policy document" opened={false}>
+<Details title="Example IAM policy document">
 ```json
 {
    "Version": "2012-10-17",
@@ -446,7 +444,7 @@ Redshift databases.
 In order to authorize Teleport to generate temporary IAM tokens, create an IAM
 role with the `GetClusterCredentials` permission:
 
-<Details title="Example IAM policy document" opened={false}>
+<Details title="Example IAM policy document">
 ```json
 {
     "Version": "2012-10-17",

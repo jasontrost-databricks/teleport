@@ -18,10 +18,16 @@ package types
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/gravitational/trace"
 
 	"github.com/gravitational/teleport/api/utils"
+)
+
+const (
+	MaxRDPScreenWidth  = 8192
+	MaxRDPScreenHeight = 8192
 )
 
 // WindowsDesktopService represents a Windows desktop service instance.
@@ -124,8 +130,6 @@ type WindowsDesktop interface {
 	ResourceWithLabels
 	// GetAddr returns the network address of this host.
 	GetAddr() string
-	// LabelsString returns all labels as a string.
-	LabelsString() string
 	// GetDomain returns the ActiveDirectory domain of this host.
 	GetDomain() string
 	// GetHostID returns the ID of the Windows Desktop Service reporting the desktop.
@@ -133,6 +137,14 @@ type WindowsDesktop interface {
 	// NonAD checks whether this is a standalone host that
 	// is not joined to an Active Directory domain.
 	NonAD() bool
+	// GetScreenSize returns the desired size of the screen to use for sessions
+	// to this host. Returns (0, 0) if no screen size is set, which means to
+	// use the size passed by the client over TDP.
+	GetScreenSize() (width, height uint32)
+	// Copy returns a copy of this windows desktop
+	Copy() *WindowsDesktopV3
+	// CloneResource returns a copy of the WindowDesktop as a ResourceWithLabels
+	CloneResource() ResourceWithLabels
 }
 
 var _ WindowsDesktop = &WindowsDesktopV3{}
@@ -165,11 +177,33 @@ func (d *WindowsDesktopV3) CheckAndSetDefaults() error {
 		return trace.BadParameter("WindowsDesktopV3.Spec missing Addr field")
 	}
 
+	// We use SNI to identify the desktop to route a connection to,
+	// and '.' will add an extra subdomain, preventing Teleport from
+	// correctly establishing TLS connections.
+	if name := d.GetName(); strings.Contains(name, ".") {
+		return trace.BadParameter("invalid name %q: desktop names cannot contain periods", name)
+	}
+
 	d.setStaticFields()
 	if err := d.ResourceHeader.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
+
+	if d.Spec.ScreenSize != nil {
+		if d.Spec.ScreenSize.Width > MaxRDPScreenWidth || d.Spec.ScreenSize.Height > MaxRDPScreenHeight {
+			return trace.BadParameter("invalid screen size %dx%d (maximum %dx%d)",
+				d.Spec.ScreenSize.Width, d.Spec.ScreenSize.Height, MaxRDPScreenWidth, MaxRDPScreenHeight)
+		}
+	}
+
 	return nil
+}
+
+func (d *WindowsDesktopV3) GetScreenSize() (width, height uint32) {
+	if d.Spec.ScreenSize == nil {
+		return 0, 0
+	}
+	return d.Spec.ScreenSize.Width, d.Spec.ScreenSize.Height
 }
 
 // NonAD checks whether host is part of Active Directory
@@ -187,11 +221,6 @@ func (d *WindowsDesktopV3) GetHostID() string {
 	return d.Spec.HostID
 }
 
-// LabelsString returns all desktop labels as a string.
-func (d *WindowsDesktopV3) LabelsString() string {
-	return LabelsAsString(d.Metadata.Labels, nil)
-}
-
 // GetDomain returns the Active Directory domain of this host.
 func (d *WindowsDesktopV3) GetDomain() string {
 	return d.Spec.Domain
@@ -204,17 +233,21 @@ func (d *WindowsDesktopV3) MatchSearch(values []string) bool {
 	return MatchSearch(fieldVals, values, nil)
 }
 
-// DeduplicateDesktops deduplicates desktops by name.
-func DeduplicateDesktops(desktops []WindowsDesktop) (result []WindowsDesktop) {
-	seen := make(map[string]struct{})
-	for _, desktop := range desktops {
-		if _, ok := seen[desktop.GetName()]; ok {
-			continue
-		}
-		seen[desktop.GetName()] = struct{}{}
-		result = append(result, desktop)
+// Copy returns a copy of this windows desktop object.
+func (d *WindowsDesktopV3) Copy() *WindowsDesktopV3 {
+	return utils.CloneProtoMsg(d)
+}
+
+func (d *WindowsDesktopV3) CloneResource() ResourceWithLabels {
+	return d.Copy()
+}
+
+// IsEqual determines if two windows desktop resources are equivalent to one another.
+func (d *WindowsDesktopV3) IsEqual(i WindowsDesktop) bool {
+	if other, ok := i.(*WindowsDesktopV3); ok {
+		return deriveTeleportEqualWindowsDesktopV3(d, other)
 	}
-	return result
+	return false
 }
 
 // Match checks if a given desktop request matches this filter.
@@ -228,7 +261,7 @@ func (f *WindowsDesktopFilter) Match(req WindowsDesktop) bool {
 	return true
 }
 
-// WindowsDesktops represents a list of windows desktops.
+// WindowsDesktops represents a list of Windows desktops.
 type WindowsDesktops []WindowsDesktop
 
 // Len returns the slice length.

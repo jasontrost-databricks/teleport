@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package kubeserver
 
@@ -21,11 +23,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,7 +42,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	spdystream "k8s.io/apimachinery/pkg/util/httpstream/spdy"
-	"k8s.io/apiserver/pkg/util/wsstream"
+	"k8s.io/apimachinery/pkg/util/httpstream/wsstream"
+	apiremotecommand "k8s.io/apimachinery/pkg/util/remotecommand"
+	"k8s.io/apiserver/pkg/endpoints/responsewriter"
 	"k8s.io/client-go/tools/remotecommand"
 
 	"github.com/gravitational/teleport/lib/defaults"
@@ -73,6 +78,12 @@ const (
 	// Value for streamType header for terminal resize stream
 	StreamTypeResize = "resize"
 
+	preV4BinaryWebsocketProtocol = wsstream.ChannelWebSocketProtocol
+	preV4Base64WebsocketProtocol = wsstream.Base64ChannelWebSocketProtocol
+	v4BinaryWebsocketProtocol    = "v4." + wsstream.ChannelWebSocketProtocol
+	v4Base64WebsocketProtocol    = "v4." + wsstream.Base64ChannelWebSocketProtocol
+	v5BinaryWebsocketProtocol    = "v5." + wsstream.ChannelWebSocketProtocol
+
 	// CloseStreamMessage is an expected keyword if stdin is enable and the
 	// underlying protocol does not support half closed streams.
 	// It is only required for websockets.
@@ -88,16 +99,39 @@ const (
 	PortForwardPayload = "Portforward handler message"
 )
 
+// Option is a functional option for KubeMockServer
+type Option func(*KubeMockServer)
+
+// WithGetPodError sets the error to be returned by the GetPod call
+func WithGetPodError(status metav1.Status) Option {
+	return func(s *KubeMockServer) {
+		s.getPodError = &status
+	}
+}
+
+// WithExecError sets the error to be returned by the Exec call
+func WithExecError(status metav1.Status) Option {
+	return func(s *KubeMockServer) {
+		s.execPodError = &status
+	}
+}
+
+type deletedResource struct {
+	requestID string
+	kind      string
+}
 type KubeMockServer struct {
-	router      *httprouter.Router
-	log         *log.Entry
-	server      *httptest.Server
-	TLS         *tls.Config
-	Addr        net.Addr
-	URL         string
-	CA          []byte
-	deletedPods map[string][]string
-	mu          sync.Mutex
+	router           *httprouter.Router
+	log              *log.Entry
+	server           *httptest.Server
+	TLS              *tls.Config
+	URL              string
+	Address          string
+	CA               []byte
+	deletedResources map[deletedResource][]string
+	getPodError      *metav1.Status
+	execPodError     *metav1.Status
+	mu               sync.Mutex
 }
 
 // NewKubeAPIMock creates Kubernetes API server for handling exec calls.
@@ -107,34 +141,60 @@ type KubeMockServer struct {
 // The output returns the container followed by a dump of the data received from stdin.
 // More endpoints can be configured
 // TODO(tigrato): add support for other endpoints
-func NewKubeAPIMock() (*KubeMockServer, error) {
+func NewKubeAPIMock(opts ...Option) (*KubeMockServer, error) {
 	s := &KubeMockServer{
-		router:      httprouter.New(),
-		log:         log.NewEntry(log.New()),
-		deletedPods: make(map[string][]string),
+		router:           httprouter.New(),
+		log:              log.NewEntry(log.New()),
+		deletedResources: make(map[deletedResource][]string),
 	}
+
+	for _, o := range opts {
+		o(s)
+	}
+
 	s.setup()
 	if err := http2.ConfigureServer(s.server.Config, &http2.Server{}); err != nil {
 		return nil, err
 	}
 	s.server.StartTLS()
 	s.TLS = s.server.TLS
-	s.Addr = s.server.Listener.Addr()
+	s.Address = strings.TrimPrefix(s.server.URL, "https://")
 	s.URL = s.server.URL
 	return s, nil
 }
 
 func (s *KubeMockServer) setup() {
 	s.router.UseRawPath = true
-	s.router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", s.withWriter(s.exec))
-	s.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/exec", s.withWriter(s.exec))
-	s.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", s.withWriter(s.portforward))
-	s.router.POST("/api/:ver/namespaces/:podNamespace/pods/:podName/portforward", s.withWriter(s.portforward))
-	s.router.GET("/api/:ver/namespaces/:podNamespace/pods", s.withWriter(s.listPods))
+	s.router.POST("/api/:ver/namespaces/:namespace/pods/:name/exec", s.withWriter(s.exec))
+	s.router.GET("/api/:ver/namespaces/:namespace/pods/:name/exec", s.withWriter(s.exec))
+	s.router.GET("/api/:ver/namespaces/:namespace/pods/:name/portforward", s.withWriter(s.portforward))
+	s.router.POST("/api/:ver/namespaces/:namespace/pods/:name/portforward", s.withWriter(s.portforward))
+
+	s.router.GET("/apis/rbac.authorization.k8s.io/:ver/clusterroles", s.withWriter(s.listClusterRoles))
+	s.router.GET("/apis/rbac.authorization.k8s.io/:ver/clusterroles/:name", s.withWriter(s.getClusterRole))
+	s.router.DELETE("/apis/rbac.authorization.k8s.io/:ver/clusterroles/:name", s.withWriter(s.deleteClusterRole))
+
+	s.router.GET("/api/:ver/namespaces/:namespace/pods", s.withWriter(s.listPods))
 	s.router.GET("/api/:ver/pods", s.withWriter(s.listPods))
-	s.router.GET("/api/:ver/namespaces/:podNamespace/pods/:podName", s.withWriter(s.getPod))
-	s.router.DELETE("/api/:ver/namespaces/:podNamespace/pods/:podName", s.withWriter(s.deletePod))
+	s.router.GET("/api/:ver/namespaces/:namespace/pods/:name", s.withWriter(s.getPod))
+	s.router.DELETE("/api/:ver/namespaces/:namespace/pods/:name", s.withWriter(s.deletePod))
+
+	s.router.GET("/api/:ver/namespaces/:namespace/secrets", s.withWriter(s.listSecrets))
+	s.router.GET("/api/:ver/secrets", s.withWriter(s.listSecrets))
+	s.router.GET("/api/:ver/namespaces/:namespace/secrets/:name", s.withWriter(s.getSecret))
+	s.router.DELETE("/api/:ver/namespaces/:namespace/secrets/:name", s.withWriter(s.deleteSecret))
+
 	s.router.POST("/apis/authorization.k8s.io/v1/selfsubjectaccessreviews", s.withWriter(s.selfSubjectAccessReviews))
+
+	s.router.GET("/apis/resources.teleport.dev/v6/namespaces/:namespace/teleportroles", s.withWriter(s.listTeleportRoles))
+	s.router.GET("/apis/resources.teleport.dev/v6/teleportroles", s.withWriter(s.listTeleportRoles))
+	s.router.GET("/apis/resources.teleport.dev/v6/namespaces/:namespace/teleportroles/:name", s.withWriter(s.getTeleportRole))
+	s.router.DELETE("/apis/resources.teleport.dev/v6/namespaces/:namespace/teleportroles/:name", s.withWriter(s.deleteTeleportRole))
+
+	for _, endpoint := range []string{"/api", "/api/:ver", "/apis", "/apis/resources.teleport.dev/v6"} {
+		s.router.GET(endpoint, s.withWriter(s.discoveryEndpoint))
+	}
+
 	s.server = httptest.NewUnstartedServer(s.router)
 	s.server.EnableHTTP2 = true
 }
@@ -157,6 +217,10 @@ func (s *KubeMockServer) formatResponseError(rw http.ResponseWriter, respErr err
 		Message: respErr.Error(),
 		Code:    int32(trace.ErrorToCode(respErr)),
 	}
+	s.writeResponseError(rw, respErr, status)
+}
+
+func (s *KubeMockServer) writeResponseError(rw http.ResponseWriter, respErr error, status *metav1.Status) {
 	data, err := runtime.Encode(kubeCodecs.LegacyCodec(), status)
 	if err != nil {
 		s.log.Warningf("Failed encoding error into kube Status object: %v", err)
@@ -167,7 +231,7 @@ func (s *KubeMockServer) formatResponseError(rw http.ResponseWriter, respErr err
 	// Always write InternalServerError, that's the only code that kubectl will
 	// parse the Status object for. The Status object has the real status code
 	// embedded.
-	rw.WriteHeader(http.StatusInternalServerError)
+	rw.WriteHeader(int(status.Code))
 	if _, err := rw.Write(data); err != nil {
 		s.log.Warningf("Failed writing kube error response body: %v", err)
 	}
@@ -175,10 +239,13 @@ func (s *KubeMockServer) formatResponseError(rw http.ResponseWriter, respErr err
 
 func (s *KubeMockServer) exec(w http.ResponseWriter, req *http.Request, p httprouter.Params) (resp any, err error) {
 	q := req.URL.Query()
-
+	if s.execPodError != nil {
+		s.writeResponseError(w, nil, s.execPodError)
+		return nil, nil
+	}
 	request := remoteCommandRequest{
-		podNamespace:       p.ByName("podNamespace"),
-		podName:            p.ByName("podName"),
+		namespace:          p.ByName("namespace"),
+		name:               p.ByName("name"),
 		containerName:      q.Get("container"),
 		cmd:                q["command"],
 		stdin:              utils.AsBool(q.Get("stdin")),
@@ -215,7 +282,7 @@ func (s *KubeMockServer) exec(w http.ResponseWriter, req *http.Request, p httpro
 		for {
 			buffer = buffer[:cap(buffer)]
 			n, err := proxy.stdinStream.Read(buffer)
-			if err == io.EOF && n == 0 {
+			if errors.Is(err, io.EOF) && n == 0 {
 				break
 			} else if err != nil && n == 0 {
 				s.log.WithError(err).Errorf("unable to receive from stdin")
@@ -255,8 +322,8 @@ func (s *KubeMockServer) exec(w http.ResponseWriter, req *http.Request, p httpro
 
 // remoteCommandRequest is a request to execute a remote command
 type remoteCommandRequest struct {
-	podNamespace       string
-	podName            string
+	namespace          string
+	name               string
 	containerName      string
 	cmd                []string
 	stdin              bool
@@ -276,18 +343,110 @@ func createRemoteCommandProxy(req remoteCommandRequest) (*remoteCommandProxy, er
 		err   error
 	)
 	if wsstream.IsWebSocketRequest(req.httpRequest) {
-		return nil, fmt.Errorf("only SPDY streams upgrades are supported")
-	}
-
-	proxy, err = createSPDYStreams(req)
-	if err != nil {
-		return nil, trace.Wrap(err)
+		proxy, err = createWebSocketStreams(req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+	} else {
+		proxy, err = createSPDYStreams(req)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	if proxy.resizeStream != nil {
 		proxy.resizeQueue = newTermQueue(req.context, req.onResize)
 		go proxy.resizeQueue.handleResizeEvents(proxy.resizeStream)
 	}
+	return proxy, nil
+}
+
+func channelOrIgnore(channel wsstream.ChannelType, real bool) wsstream.ChannelType {
+	if real {
+		return channel
+	}
+	return wsstream.IgnoreChannel
+}
+
+func createWebSocketStreams(req remoteCommandRequest) (*remoteCommandProxy, error) {
+	channels := make([]wsstream.ChannelType, 5)
+	channels[apiremotecommand.StreamStdIn] = channelOrIgnore(wsstream.ReadChannel, req.stdin)
+	channels[apiremotecommand.StreamStdOut] = channelOrIgnore(wsstream.WriteChannel, req.stdout)
+	channels[apiremotecommand.StreamStdErr] = channelOrIgnore(wsstream.WriteChannel, req.stderr)
+	channels[apiremotecommand.StreamErr] = wsstream.WriteChannel
+	channels[apiremotecommand.StreamResize] = wsstream.ReadChannel
+
+	conn := wsstream.NewConn(map[string]wsstream.ChannelProtocolConfig{
+		"": {
+			Binary:   true,
+			Channels: channels,
+		},
+		preV4BinaryWebsocketProtocol: {
+			Binary:   true,
+			Channels: channels,
+		},
+		preV4Base64WebsocketProtocol: {
+			Binary:   false,
+			Channels: channels,
+		},
+		v4BinaryWebsocketProtocol: {
+			Binary:   true,
+			Channels: channels,
+		},
+		v4Base64WebsocketProtocol: {
+			Binary:   false,
+			Channels: channels,
+		},
+		v5BinaryWebsocketProtocol: {
+			Binary:   true,
+			Channels: channels,
+		},
+	})
+	conn.SetIdleTimeout(IdleTimeout)
+	_, streams, err := conn.Open(
+		responsewriter.GetOriginal(req.httpResponseWriter),
+		req.httpRequest,
+	)
+	if err != nil {
+		return nil, trace.Wrap(err, "unable to upgrade websocket connection")
+	}
+
+	// Send an empty message to the lowest writable channel to notify the client the connection is established
+	switch {
+	case req.stdout:
+		streams[apiremotecommand.StreamStdOut].Write([]byte{})
+	case req.stderr:
+		streams[apiremotecommand.StreamStdErr].Write([]byte{})
+	default:
+		streams[apiremotecommand.StreamErr].Write([]byte{})
+	}
+
+	proxy := &remoteCommandProxy{
+		conn:         conn,
+		stdinStream:  streams[apiremotecommand.StreamStdIn],
+		stdoutStream: streams[apiremotecommand.StreamStdOut],
+		stderrStream: streams[apiremotecommand.StreamStdErr],
+		tty:          req.tty,
+		resizeStream: streams[apiremotecommand.StreamResize],
+	}
+
+	// When stdin, stdout or stderr are not enabled, websocket creates a io.Pipe
+	// for them so they are not nil.
+	// Since we need to forward to another k8s server (Teleport or real k8s API),
+	// we must disabled the readers, otherwise the SPDY executor will wait for
+	// read/write into the streams and will hang.
+	if !req.stdin {
+		proxy.stdinStream = nil
+	}
+	if !req.stdout {
+		proxy.stdoutStream = nil
+	}
+	if !req.stderr {
+		proxy.stderrStream = nil
+	}
+
+	proxy.writeStatus = v4WriteStatusFunc(streams[apiremotecommand.StreamErr])
+
 	return proxy, nil
 }
 
@@ -425,7 +584,7 @@ func (t *termQueue) handleResizeEvents(stream io.Reader) {
 	for {
 		size := remotecommand.TerminalSize{}
 		if err := decoder.Decode(&size); err != nil {
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) {
 				log.Warningf("Failed to decode resize event: %v", err)
 			}
 			t.cancel()
@@ -586,7 +745,7 @@ func (s *KubeMockServer) portforward(w http.ResponseWriter, req *http.Request, p
 		errStream.Write([]byte(err.Error()))
 		return nil, nil
 	}
-	fmt.Fprint(data, PortForwardPayload, p.ByName("podName"), string(buf[:n]))
+	fmt.Fprint(data, PortForwardPayload, p.ByName("name"), string(buf[:n]))
 	return nil, nil
 }
 

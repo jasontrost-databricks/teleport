@@ -1,18 +1,20 @@
 /*
-Copyright 2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package app
 
@@ -20,24 +22,20 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gravitational/oxy/forward"
 	"github.com/gravitational/trace"
-	"github.com/gravitational/ttlmap"
 	"github.com/sirupsen/logrus"
 
 	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/api/types/wrappers"
-	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
-	"github.com/gravitational/teleport/lib/events/filesessions"
-	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/events/recorder"
+	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
 	rsession "github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/srv"
 	"github.com/gravitational/teleport/lib/srv/app/common"
@@ -94,17 +92,16 @@ type sessionOpt func(context.Context, *sessionChunk, *tlsca.Identity, types.Appl
 // The session chunk is created with inflight=1,
 // and as such expects `release()` to eventually be called
 // by the caller of this function.
-func (s *Server) newSessionChunk(ctx context.Context, identity *tlsca.Identity, app types.Application, opts ...sessionOpt) (*sessionChunk, error) {
+func (s *Server) newSessionChunk(ctx context.Context, identity *tlsca.Identity, app types.Application, startTime time.Time, opts ...sessionOpt) (*sessionChunk, error) {
 	sess := &sessionChunk{
 		id:           uuid.New().String(),
 		closeC:       make(chan struct{}),
 		inflightCond: sync.NewCond(&sync.Mutex{}),
-		inflight:     1,
 		closeTimeout: sessionChunkCloseTimeout,
 		log:          s.log,
 	}
 
-	sess.log.Debugf("Created app session chunk %s", sess.id)
+	sess.log.Debugf("Creating app session chunk %s", sess.id)
 
 	// Create a session tracker so that other services, such as the
 	// session upload completer, can track the session chunk's lifetime.
@@ -113,14 +110,17 @@ func (s *Server) newSessionChunk(ctx context.Context, identity *tlsca.Identity, 
 	}
 
 	// Create the stream writer that will write this chunk to the audit log.
-	streamWriter, err := s.newStreamWriter(sess.id)
+	// Audit stream is using server context, not session context,
+	// to make sure that session is uploaded even after it is closed.
+	rec, err := s.newSessionRecorder(s.closeContext, startTime, sess.id)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	sess.streamCloser = streamWriter
+	sess.streamCloser = rec
 
 	audit, err := common.NewAudit(common.AuditConfig{
-		Emitter: streamWriter,
+		Emitter:  s.c.Emitter,
+		Recorder: rec,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -133,28 +133,39 @@ func (s *Server) newSessionChunk(ctx context.Context, identity *tlsca.Identity, 
 		}
 	}
 
-	// Put the session chunk in the cache so that upcoming requests can use it for
-	// 5 minutes or the time until the certificate expires, whichever comes first.
-	ttl := utils.MinTTL(identity.Expires.Sub(s.c.Clock.Now()), 5*time.Minute)
-	if err = s.cache.set(identity.RouteToApp.SessionID, sess, ttl); err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	// only emit a session chunk if we didnt get an error making the new session chunk
+	// only emit a session chunk if we didn't get an error making the new session chunk
 	if err := sess.audit.OnSessionChunk(ctx, s.c.HostID, sess.id, identity, app); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
+	sess.log.Debugf("Created app session chunk %s", sess.id)
 	return sess, nil
 }
 
 // withJWTTokenForwarder is a sessionOpt that creates a forwarder that attaches
 // a generated JWT token to all requests.
 func (s *Server) withJWTTokenForwarder(ctx context.Context, sess *sessionChunk, identity *tlsca.Identity, app types.Application) error {
+	rewrite := app.GetRewrite()
+	traits := identity.Traits
+	roles := identity.Groups
+	if rewrite != nil {
+		switch rewrite.JWTClaims {
+		case types.JWTClaimsRewriteNone:
+			traits = nil
+			roles = nil
+		case types.JWTClaimsRewriteRoles:
+			traits = nil
+		case types.JWTClaimsRewriteTraits:
+			roles = nil
+		case "", types.JWTClaimsRewriteRolesAndTraits:
+		}
+	}
+
 	// Request a JWT token that will be attached to all requests.
 	jwt, err := s.c.AuthClient.GenerateAppToken(ctx, types.GenerateAppTokenRequest{
 		Username: identity.Username,
-		Roles:    identity.Groups,
-		Traits:   identity.Traits,
+		Roles:    roles,
+		Traits:   traits,
 		URI:      app.GetURI(),
 		Expires:  identity.Expires,
 	})
@@ -163,7 +174,6 @@ func (s *Server) withJWTTokenForwarder(ctx context.Context, sess *sessionChunk, 
 	}
 
 	// Add JWT token to the traits so it can be used in headers templating.
-	traits := identity.Traits
 	if traits == nil {
 		traits = make(wrappers.Traits)
 	}
@@ -183,19 +193,17 @@ func (s *Server) withJWTTokenForwarder(ctx context.Context, sess *sessionChunk, 
 		return trace.Wrap(err)
 	}
 
-	delegate := forward.NewHeaderRewriter()
-	fwd, err := forward.New(
-		forward.FlushInterval(100*time.Millisecond),
-		forward.RoundTripper(transport),
-		forward.Logger(logrus.StandardLogger()),
-		forward.WebsocketRewriter(common.NewHeaderRewriter(transport.ws, delegate)),
-		forward.WebsocketDial(transport.ws.dialer),
-		forward.Rewriter(common.NewHeaderRewriter(delegate)),
+	delegate := reverseproxy.NewHeaderRewriter()
+	sess.handler, err = reverseproxy.New(
+		reverseproxy.WithFlushInterval(100*time.Millisecond),
+		reverseproxy.WithRoundTripper(transport),
+		reverseproxy.WithLogger(sess.log),
+		reverseproxy.WithRewriter(common.NewHeaderRewriter(delegate)),
 	)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	sess.handler = fwd
+
 	return nil
 }
 
@@ -266,17 +274,29 @@ func (s *sessionChunk) close(ctx context.Context) error {
 	return trace.Wrap(s.streamCloser.Close(ctx))
 }
 
-func (s *Server) closeSession(sess *sessionChunk) {
-	if err := sess.close(s.closeContext); err != nil {
-		s.log.WithError(err).Debugf("Error closing session %v", sess.id)
+func (s *Server) onSessionExpired(ctx context.Context, key, expired any) {
+	sess, ok := expired.(*sessionChunk)
+	if !ok {
+		return
 	}
+
+	// Closing the session stream writer may trigger a flush operation which could
+	// be time-consuming. Launch in another goroutine to prevent interfering with
+	// cache operations.
+	s.cacheCloseWg.Add(1)
+	go func() {
+		defer s.cacheCloseWg.Done()
+		if err := sess.close(ctx); err != nil {
+			s.log.WithError(err).Debugf("Error closing session %v", sess.id)
+		}
+	}()
 }
 
-// newStreamWriter creates a session stream that will be used to record
+// newSessionRecorder creates a session stream that will be used to record
 // requests that occur within this session chunk and upload the recording
 // to the Auth server.
-func (s *Server) newStreamWriter(chunkID string) (events.StreamWriter, error) {
-	recConfig, err := s.c.AccessPoint.GetSessionRecordingConfig(s.closeContext)
+func (s *Server) newSessionRecorder(ctx context.Context, startTime time.Time, chunkID string) (events.SessionPreparerRecorder, error) {
+	recConfig, err := s.c.AccessPoint.GetSessionRecordingConfig(ctx)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -286,51 +306,24 @@ func (s *Server) newStreamWriter(chunkID string) (events.StreamWriter, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	// Create a sync or async streamer depending on configuration of cluster.
-	streamer, err := s.newStreamer(chunkID, recConfig)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	streamWriter, err := events.NewAuditWriter(events.AuditWriterConfig{
-		// Audit stream is using server context, not session context,
-		// to make sure that session is uploaded even after it is closed
-		Context:      s.closeContext,
-		Streamer:     streamer,
-		Clock:        s.c.Clock,
+	rec, err := recorder.New(recorder.Config{
 		SessionID:    rsession.ID(chunkID),
-		Namespace:    apidefaults.Namespace,
 		ServerID:     s.c.HostID,
-		RecordOutput: recConfig.GetMode() != types.RecordOff,
-		Component:    teleport.ComponentApp,
+		Namespace:    apidefaults.Namespace,
+		Clock:        s.c.Clock,
 		ClusterName:  clusterName.GetClusterName(),
+		RecordingCfg: recConfig,
+		SyncStreamer: s.c.AuthClient,
+		DataDir:      s.c.DataDir,
+		Component:    teleport.Component(teleport.ComponentSession, teleport.ComponentApp),
+		Context:      ctx,
+		StartTime:    startTime,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	return streamWriter, nil
-}
-
-// newStreamer returns sync or async streamer based on the configuration
-// of the server and the session, sync streamer sends the events
-// directly to the auth server and blocks if the events can not be received,
-// async streamer buffers the events to disk and uploads the events later
-func (s *Server) newStreamer(chunkID string, recConfig types.SessionRecordingConfig) (events.Streamer, error) {
-	if services.IsRecordSync(recConfig.GetMode()) {
-		s.log.Debugf("Using sync streamer for session chunk %v.", chunkID)
-		return s.c.AuthClient, nil
-	}
-
-	s.log.Debugf("Using async streamer for session chunk %v.", chunkID)
-	uploadDir := filepath.Join(
-		s.c.DataDir, teleport.LogsDir, teleport.ComponentUpload,
-		events.StreamingSessionsDir, apidefaults.Namespace,
-	)
-	fileStreamer, err := filesessions.NewStreamer(uploadDir)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-	return events.NewTeeStreamer(fileStreamer, s.c.Emitter), nil
+	return rec, nil
 }
 
 // createTracker creates a new session tracker for the session chunk.
@@ -349,6 +342,7 @@ func (s *Server) createTracker(sess *sessionChunk, identity *tlsca.Identity, app
 		Created:      s.c.Clock.Now(),
 		AppName:      appName, // app name is only present in RouteToApp for CLI sessions
 		AppSessionID: identity.RouteToApp.SessionID,
+		HostID:       s.c.HostID,
 	}
 
 	s.log.Debugf("Creating tracker for session chunk %v", sess.id)
@@ -365,105 +359,4 @@ func (s *Server) createTracker(sess *sessionChunk, identity *tlsca.Identity, app
 	}()
 
 	return nil
-}
-
-// sessionChunkCache holds a cache of session chunks.
-type sessionChunkCache struct {
-	srv *Server
-
-	mu    sync.Mutex
-	cache *ttlmap.TTLMap
-}
-
-// newSessionChunkCache creates a new session chunk cache.
-func (s *Server) newSessionChunkCache() (*sessionChunkCache, error) {
-	sessionCache := &sessionChunkCache{srv: s}
-
-	// Cache of session chunks. Set an expire function that can be used
-	// to close and upload the stream of events to the Audit Log.
-	var err error
-	sessionCache.cache, err = ttlmap.New(defaults.ClientCacheSize, ttlmap.CallOnExpire(sessionCache.expire), ttlmap.Clock(s.c.Clock))
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	go sessionCache.expireSessions()
-
-	return sessionCache, nil
-}
-
-// get will fetch the session chunk from the cache.
-func (s *sessionChunkCache) get(key string) (*sessionChunk, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if f, ok := s.cache.Get(key); ok {
-		if fwd, fok := f.(*sessionChunk); fok {
-			return fwd, nil
-		}
-		return nil, trace.BadParameter("invalid type stored in cache: %T", f)
-	}
-	return nil, trace.NotFound("session not found")
-}
-
-// set will add the session chunk to the cache.
-func (s *sessionChunkCache) set(sessionID string, sess *sessionChunk, ttl time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.cache.Set(sessionID, sess, ttl); err != nil {
-		return trace.Wrap(err)
-	}
-	return nil
-}
-
-// expire will close the stream writer.
-func (s *sessionChunkCache) expire(key string, el interface{}) {
-	// Closing the session stream writer may trigger a flush operation which could
-	// be time-consuming. Launch in another goroutine since this occurs under a
-	// lock and expire can get called during a "get" operation on the ttlmap.
-	go s.closeSession(el)
-	s.srv.log.Debugf("Closing expired stream %v.", key)
-}
-
-func (s *sessionChunkCache) closeSession(el interface{}) {
-	switch sess := el.(type) {
-	case *sessionChunk:
-		s.srv.closeSession(sess)
-	default:
-		s.srv.log.Debugf("Invalid type stored in cache: %T.", el)
-	}
-}
-
-// expireSessions ticks every second trying to close expired sessions.
-func (s *sessionChunkCache) expireSessions() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.expiredSessions()
-		case <-s.srv.closeContext.Done():
-			return
-		}
-	}
-}
-
-// expiredSession tries to expire sessions in the cache.
-func (s *sessionChunkCache) expiredSessions() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.cache.RemoveExpired(10)
-}
-
-// closeAllSessions will remove and close all sessions in the cache.
-func (s *sessionChunkCache) closeAllSessions() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, session, ok := s.cache.Pop(); ok; _, session, ok = s.cache.Pop() {
-		s.closeSession(session)
-	}
 }

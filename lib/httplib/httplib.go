@@ -1,24 +1,27 @@
 /*
-Copyright 2015 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 // Package httplib implements common utility functions for writing
 // classic HTTP handlers
 package httplib
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"mime"
@@ -27,6 +30,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/gravitational/roundtrip"
 	"github.com/gravitational/trace"
@@ -39,6 +43,12 @@ import (
 	tracehttp "github.com/gravitational/teleport/api/observability/tracing/http"
 	"github.com/gravitational/teleport/lib/httplib/csrf"
 	"github.com/gravitational/teleport/lib/utils"
+)
+
+var (
+	_ http.ResponseWriter = (*ResponseStatusRecorder)(nil)
+	_ http.Flusher        = (*ResponseStatusRecorder)(nil)
+	_ http.Hijacker       = (*ResponseStatusRecorder)(nil)
 )
 
 // timeoutMessage is a generic "timeout" error message that is displayed as a more user-friendly alternative to
@@ -95,6 +105,14 @@ func MakeTracingHandler(h http.Handler, component string) http.Handler {
 	}
 
 	return otelhttp.NewHandler(http.HandlerFunc(handler), component, otelhttp.WithSpanNameFormatter(tracehttp.HandlerFormatter))
+}
+
+// MakeTracingMiddleware returns an HTTP middleware that makes tracing
+// handlers.
+func MakeTracingMiddleware(component string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return MakeTracingHandler(next, component)
+	}
 }
 
 // MakeHandlerWithErrorWriter returns a httprouter.Handle from the HandlerFunc,
@@ -241,14 +259,24 @@ func RewritePaths(next http.Handler, rewrites ...RewritePair) http.Handler {
 	})
 }
 
-// SafeRedirect performs a relative redirect to the URI part of the provided redirect URL
-func SafeRedirect(w http.ResponseWriter, r *http.Request, redirectURL string) error {
+// OriginLocalRedirectURI will take an incoming URL including optionally the host and scheme and return the URI
+// associated with the URL.  Additionally, it will ensure that the URI does not include any techniques potentially
+// used to redirect to a different origin.
+func OriginLocalRedirectURI(redirectURL string) (string, error) {
 	parsedURL, err := url.Parse(redirectURL)
 	if err != nil {
-		return trace.Wrap(err)
+		return "", trace.Wrap(err)
+	} else if parsedURL.IsAbs() && (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		return "", trace.BadParameter("Invalid scheme: %s", parsedURL.Scheme)
 	}
-	http.Redirect(w, r, parsedURL.RequestURI(), http.StatusFound)
-	return nil
+
+	resultURI := parsedURL.RequestURI()
+	if strings.HasPrefix(resultURI, "//") {
+		return "", trace.BadParameter("Invalid double slash redirect")
+	} else if strings.Contains(resultURI, "@") {
+		return "", trace.BadParameter("Basic Auth not allowed in redirect")
+	}
+	return resultURI, nil
 }
 
 // ResponseStatusRecorder is an http.ResponseWriter that records the response status code.
@@ -297,4 +325,13 @@ func (r *ResponseStatusRecorder) Status() int {
 		return http.StatusOK
 	}
 	return r.status
+}
+
+// Hijack implements the http.Hijacker interface.
+func (r *ResponseStatusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("hijack not supported")
+	}
+	return h.Hijack()
 }

@@ -1,18 +1,20 @@
 /*
-Copyright 2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package keystore
 
@@ -31,6 +33,7 @@ import (
 	"github.com/miekg/pkcs11"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/constants"
 	"github.com/gravitational/teleport/api/types"
 )
@@ -67,6 +70,7 @@ type pkcs11KeyStore struct {
 	hostUUID  string
 	log       logrus.FieldLogger
 	isYubiHSM bool
+	semaphore chan struct{}
 }
 
 func newPKCS11KeyStore(config *PKCS11Config, logger logrus.FieldLogger) (*pkcs11KeyStore, error) {
@@ -88,14 +92,21 @@ func newPKCS11KeyStore(config *PKCS11Config, logger logrus.FieldLogger) (*pkcs11
 		return nil, trace.Wrap(err, "getting PKCS#11 module info")
 	}
 
-	logger = logger.WithFields(logrus.Fields{trace.Component: "PKCS11KeyStore"})
+	logger = logger.WithFields(logrus.Fields{teleport.ComponentKey: "PKCS11KeyStore"})
 
 	return &pkcs11KeyStore{
 		ctx:       ctx,
 		hostUUID:  config.HostUUID,
 		log:       logger,
 		isYubiHSM: strings.HasPrefix(info.ManufacturerID, "Yubico"),
+		semaphore: make(chan struct{}, 1),
 	}, nil
+}
+
+// keyTypeDescription returns a human-readable description of the types of keys
+// this backend uses.
+func (p *pkcs11KeyStore) keyTypeDescription() string {
+	return fmt.Sprintf("PKCS#11 HSM keys created by %s", p.hostUUID)
 }
 
 func (p *pkcs11KeyStore) findUnusedID() (keyID, error) {
@@ -115,7 +126,7 @@ func (p *pkcs11KeyStore) findUnusedID() (keyID, error) {
 	// https://developers.yubico.com/YubiHSM2/Concepts/Object_ID.html
 	for id := uint16(1); id < 0xffff; id++ {
 		idBytes := []byte{byte((id >> 8) & 0xff), byte(id & 0xff)}
-		existingSigner, err := p.ctx.FindKeyPair(idBytes, []byte(p.hostUUID))
+		existingSigner, err := p.ctx.FindKeyPair(idBytes, nil /*label*/)
 		// FindKeyPair is expected to return nil, nil if the id is not found,
 		// any error is unexpected.
 		if err != nil {
@@ -136,11 +147,19 @@ func (p *pkcs11KeyStore) findUnusedID() (keyID, error) {
 // crypto.Signer. The returned identifier can be passed to getSigner later to
 // get the same crypto.Signer.
 func (p *pkcs11KeyStore) generateRSA(ctx context.Context, options ...RSAKeyOption) ([]byte, crypto.Signer, error) {
-	p.log.Debug("Creating new HSM keypair")
+	// the key identifiers are not created in a thread safe
+	// manner so all calls are serialized to prevent races.
+	p.semaphore <- struct{}{}
+	defer func() {
+		<-p.semaphore
+	}()
+
 	id, err := p.findUnusedID()
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
+
+	p.log.Debugf("Creating new HSM keypair %v", id)
 
 	ckaID, err := id.pkcs11Key(p.isYubiHSM)
 	if err != nil {
@@ -159,11 +178,15 @@ func (p *pkcs11KeyStore) generateRSA(ctx context.Context, options ...RSAKeyOptio
 }
 
 // getSigner returns a crypto.Signer for the given key identifier, if it is found.
-func (p *pkcs11KeyStore) getSigner(ctx context.Context, rawKey []byte) (crypto.Signer, error) {
+func (p *pkcs11KeyStore) getSigner(ctx context.Context, rawKey []byte, publicKey crypto.PublicKey) (crypto.Signer, error) {
+	return p.getSignerWithoutPublicKey(ctx, rawKey)
+}
+
+func (p *pkcs11KeyStore) getSignerWithoutPublicKey(ctx context.Context, rawKey []byte) (crypto.Signer, error) {
 	if t := keyType(rawKey); t != types.PrivateKeyType_PKCS11 {
 		return nil, trace.BadParameter("pkcs11KeyStore cannot get signer for key type %s", t.String())
 	}
-	keyID, err := parseKeyID(rawKey)
+	keyID, err := parsePKCS11KeyID(rawKey)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -179,7 +202,7 @@ func (p *pkcs11KeyStore) getSigner(ctx context.Context, rawKey []byte) (crypto.S
 		return nil, trace.Wrap(err)
 	}
 	if signer == nil {
-		return nil, trace.NotFound("failed to find keypair for given id")
+		return nil, trace.NotFound("failed to find keypair with id %v", keyID)
 	}
 	return signer, nil
 }
@@ -192,7 +215,7 @@ func (p *pkcs11KeyStore) canSignWithKey(ctx context.Context, raw []byte, keyType
 	if keyType != types.PrivateKeyType_PKCS11 {
 		return false, nil
 	}
-	keyID, err := parseKeyID(raw)
+	keyID, err := parsePKCS11KeyID(raw)
 	if err != nil {
 		return false, trace.Wrap(err)
 	}
@@ -201,7 +224,7 @@ func (p *pkcs11KeyStore) canSignWithKey(ctx context.Context, raw []byte, keyType
 
 // deleteKey deletes the given key from the HSM
 func (p *pkcs11KeyStore) deleteKey(_ context.Context, rawKey []byte) error {
-	keyID, err := parseKeyID(rawKey)
+	keyID, err := parsePKCS11KeyID(rawKey)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -222,12 +245,12 @@ func (p *pkcs11KeyStore) deleteKey(_ context.Context, rawKey []byte) error {
 	return trace.Wrap(signer.Delete())
 }
 
-// DeleteUnusedKeys deletes all keys from the KeyStore if they are:
+// deleteUnusedKeys deletes all keys from the KeyStore if they are:
 // 1. Labeled with the local HostUUID when they were created
 // 2. Not included in the argument activeKeys
 // This is meant to delete unused keys after they have been rotated out by a CA
 // rotation.
-func (p *pkcs11KeyStore) DeleteUnusedKeys(ctx context.Context, activeKeys [][]byte) error {
+func (p *pkcs11KeyStore) deleteUnusedKeys(ctx context.Context, activeKeys [][]byte) error {
 	p.log.Debug("Deleting unused keys from HSM")
 
 	// It's necessary to fetch all PublicKeys for the known activeKeys in order to
@@ -238,7 +261,7 @@ func (p *pkcs11KeyStore) DeleteUnusedKeys(ctx context.Context, activeKeys [][]by
 		if keyType(activeKey) != types.PrivateKeyType_PKCS11 {
 			continue
 		}
-		keyID, err := parseKeyID(activeKey)
+		keyID, err := parsePKCS11KeyID(activeKey)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -248,7 +271,7 @@ func (p *pkcs11KeyStore) DeleteUnusedKeys(ctx context.Context, activeKeys [][]by
 			// by FindKeyPairs below which queries by host UUID.
 			continue
 		}
-		signer, err := p.getSigner(ctx, activeKey)
+		signer, err := p.getSignerWithoutPublicKey(ctx, activeKey)
 		if trace.IsNotFound(err) {
 			// Failed to find a currently active key owned by this host.
 			// The cluster is in a bad state, refuse to delete any keys.
@@ -286,6 +309,7 @@ func (p *pkcs11KeyStore) DeleteUnusedKeys(ctx context.Context, activeKeys [][]by
 		if keyIsActive(signer) {
 			continue
 		}
+		p.log.Infof("Deleting unused key from HSM")
 		if err := signer.Delete(); err != nil {
 			// Key deletion is best-effort, log a warning on errors, and
 			// continue trying to delete other keys. Errors have been observed
@@ -331,7 +355,7 @@ func (k keyID) pkcs11Key(isYubiHSM bool) ([]byte, error) {
 	return id[:], nil
 }
 
-func parseKeyID(key []byte) (keyID, error) {
+func parsePKCS11KeyID(key []byte) (keyID, error) {
 	var keyID keyID
 	if keyType(key) != types.PrivateKeyType_PKCS11 {
 		return keyID, trace.BadParameter("unable to parse invalid pkcs11 key")

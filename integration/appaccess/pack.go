@@ -1,16 +1,20 @@
-// Copyright 2022 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package appaccess
 
@@ -30,12 +34,13 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/gravitational/oxy/forward"
 	"github.com/gravitational/trace"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/breaker"
+	"github.com/gravitational/teleport/api/client/proto"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -43,8 +48,10 @@ import (
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/auth/native"
 	"github.com/gravitational/teleport/lib/client"
+	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/httplib/csrf"
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/httplib/reverseproxy"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	"github.com/gravitational/teleport/lib/services"
@@ -54,6 +61,7 @@ import (
 	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/teleport/lib/web"
 	"github.com/gravitational/teleport/lib/web/app"
+	websession "github.com/gravitational/teleport/lib/web/session"
 )
 
 // Pack contains identity as well as initialized Teleport clusters and instances.
@@ -149,12 +157,20 @@ func (p *Pack) RootWebAddr() string {
 	return p.rootCluster.Web
 }
 
+func (p *Pack) RootAppName() string {
+	return p.rootAppName
+}
+
 func (p *Pack) RootAppClusterName() string {
 	return p.rootAppClusterName
 }
 
 func (p *Pack) RootAppPublicAddr() string {
 	return p.rootAppPublicAddr
+}
+
+func (p *Pack) LeafAppName() string {
+	return p.leafAppName
 }
 
 func (p *Pack) LeafAppClusterName() string {
@@ -181,12 +197,12 @@ func (p *Pack) CreateUser(t *testing.T) (types.User, string) {
 
 	role := services.RoleForUser(user)
 	role.SetLogins(types.Allow, []string{username, "root", "ubuntu"})
-	err = p.rootCluster.Process.GetAuthServer().UpsertRole(context.Background(), role)
+	role, err = p.rootCluster.Process.GetAuthServer().UpsertRole(context.Background(), role)
 	require.NoError(t, err)
 
 	user.AddRole(role.GetName())
 	user.SetTraits(map[string][]string{"env": {"production"}, "empty": {}, "nil": nil})
-	err = p.rootCluster.Process.GetAuthServer().CreateUser(context.Background(), user)
+	user, err = p.rootCluster.Process.GetAuthServer().CreateUser(context.Background(), user)
 	require.NoError(t, err)
 
 	err = p.rootCluster.Process.GetAuthServer().UpsertPassword(user.GetName(), []byte(password))
@@ -242,7 +258,7 @@ func (p *Pack) initWebSession(t *testing.T) {
 	// Extract session cookie and bearer token.
 	require.Len(t, resp.Cookies(), 1)
 	cookie := resp.Cookies()[0]
-	require.Equal(t, cookie.Name, web.CookieName)
+	require.Equal(t, websession.CookieName, cookie.Name)
 
 	p.webCookie = cookie.Value
 	p.webToken = csResp.Token
@@ -269,6 +285,22 @@ func (p *Pack) MakeTeleportClient(t *testing.T, user string) *client.TeleportCli
 	}, *creds)
 	require.NoError(t, err)
 	return tc
+}
+
+// GenerateAndSetupUserCreds is useful in situations where we need to manually manipulate user
+// certs, for example when we want to force a TeleportClient to operate using expired certs.
+//
+// ttl equals to 0 means that the certs will have the default TTL used by helpers.GenerateUserCreds.
+func (p *Pack) GenerateAndSetupUserCreds(t *testing.T, tc *client.TeleportClient, ttl time.Duration) {
+	creds, err := helpers.GenerateUserCreds(helpers.UserCredsRequest{
+		Process:  p.rootCluster.Process,
+		Username: tc.Username,
+		TTL:      ttl,
+	})
+	require.NoError(t, err)
+
+	err = helpers.SetupUserCreds(tc, p.rootCluster.Process.Config.Proxy.SSHAddr.Addr, *creds)
+	require.NoError(t, err)
 }
 
 // CreateAppSession creates an application session with the root cluster. The
@@ -307,7 +339,7 @@ func (p *Pack) CreateAppSession(t *testing.T, publicAddr, clusterName string) []
 // cluster and returns the client cert that can be used for an application
 // request.
 func (p *Pack) CreateAppSessionWithClientCert(t *testing.T) []tls.Certificate {
-	session, err := p.tc.CreateAppSession(context.Background(), types.CreateAppSessionRequest{
+	session, err := p.tc.CreateAppSession(context.Background(), &proto.CreateAppSessionRequest{
 		Username:    p.username,
 		PublicAddr:  p.rootAppPublicAddr,
 		ClusterName: p.rootAppClusterName,
@@ -346,7 +378,7 @@ func (p *Pack) makeWebapiRequest(method, endpoint string, payload []byte) (int, 
 	}
 
 	req.AddCookie(&http.Cookie{
-		Name:  web.CookieName,
+		Name:  websession.CookieName,
 		Value: p.webCookie,
 	})
 	req.Header.Add("Authorization", fmt.Sprintf("Bearer %v", p.webToken))
@@ -357,16 +389,15 @@ func (p *Pack) makeWebapiRequest(method, endpoint string, payload []byte) (int, 
 }
 
 func (p *Pack) ensureAuditEvent(t *testing.T, eventType string, checkEvent func(event apievents.AuditEvent)) {
+	ctx := context.Background()
 	require.Eventuallyf(t, func() bool {
-		events, _, err := p.rootCluster.Process.GetAuthServer().SearchEvents(
-			time.Now().Add(-time.Hour),
-			time.Now().Add(time.Hour),
-			apidefaults.Namespace,
-			[]string{eventType},
-			1,
-			types.EventOrderDescending,
-			"",
-		)
+		events, _, err := p.rootCluster.Process.GetAuthServer().SearchEvents(ctx, events.SearchEventsRequest{
+			From:       time.Now().Add(-time.Hour),
+			To:         time.Now().Add(time.Hour),
+			EventTypes: []string{eventType},
+			Limit:      1,
+			Order:      types.EventOrderDescending,
+		})
 		require.NoError(t, err)
 		if len(events) == 0 {
 			return false
@@ -693,27 +724,23 @@ func (p *Pack) startRootAppServers(t *testing.T, count int, opts AppTestOptions)
 							Value: "rewritten-app-jwt-header",
 						},
 						{
-							Name:  teleport.AppCFHeader,
-							Value: "rewritten-app-cf-header",
-						},
-						{
 							Name:  common.TeleportAPIErrorHeader,
 							Value: "rewritten-x-teleport-api-error",
 						},
 						{
-							Name:  forward.XForwardedFor,
+							Name:  reverseproxy.XForwardedFor,
 							Value: "rewritten-x-forwarded-for-header",
 						},
 						{
-							Name:  forward.XForwardedHost,
+							Name:  reverseproxy.XForwardedHost,
 							Value: "rewritten-x-forwarded-host-header",
 						},
 						{
-							Name:  forward.XForwardedProto,
+							Name:  reverseproxy.XForwardedProto,
 							Value: "rewritten-x-forwarded-proto-header",
 						},
 						{
-							Name:  forward.XForwardedServer,
+							Name:  reverseproxy.XForwardedServer,
 							Value: "rewritten-x-forwarded-server-header",
 						},
 						{
@@ -721,7 +748,7 @@ func (p *Pack) startRootAppServers(t *testing.T, count int, opts AppTestOptions)
 							Value: "rewritten-x-forwarded-ssl-header",
 						},
 						{
-							Name:  forward.XForwardedPort,
+							Name:  reverseproxy.XForwardedPort,
 							Value: "rewritten-x-forwarded-port-header",
 						},
 						// Make sure we can insert JWT token in custom header.
@@ -752,7 +779,7 @@ func (p *Pack) startRootAppServers(t *testing.T, count int, opts AppTestOptions)
 	return servers
 }
 
-func waitForAppServer(t *testing.T, tunnel reversetunnel.Server, name string, hostUUID string, apps []servicecfg.App) {
+func waitForAppServer(t *testing.T, tunnel reversetunnelclient.Server, name string, hostUUID string, apps []servicecfg.App) {
 	// Make sure that the app server is ready to accept connections.
 	// The remote site cache needs to be filled with new registered application services.
 	waitForAppRegInRemoteSiteCache(t, tunnel, name, apps, hostUUID)
@@ -836,27 +863,23 @@ func (p *Pack) startLeafAppServers(t *testing.T, count int, opts AppTestOptions)
 							Value: "rewritten-app-jwt-header",
 						},
 						{
-							Name:  teleport.AppCFHeader,
-							Value: "rewritten-app-cf-header",
-						},
-						{
 							Name:  common.TeleportAPIErrorHeader,
 							Value: "rewritten-x-teleport-api-error",
 						},
 						{
-							Name:  forward.XForwardedFor,
+							Name:  reverseproxy.XForwardedFor,
 							Value: "rewritten-x-forwarded-for-header",
 						},
 						{
-							Name:  forward.XForwardedHost,
+							Name:  reverseproxy.XForwardedHost,
 							Value: "rewritten-x-forwarded-host-header",
 						},
 						{
-							Name:  forward.XForwardedProto,
+							Name:  reverseproxy.XForwardedProto,
 							Value: "rewritten-x-forwarded-proto-header",
 						},
 						{
-							Name:  forward.XForwardedServer,
+							Name:  reverseproxy.XForwardedServer,
 							Value: "rewritten-x-forwarded-server-header",
 						},
 						{
@@ -864,7 +887,7 @@ func (p *Pack) startLeafAppServers(t *testing.T, count int, opts AppTestOptions)
 							Value: "rewritten-x-forwarded-ssl-header",
 						},
 						{
-							Name:  forward.XForwardedPort,
+							Name:  reverseproxy.XForwardedPort,
 							Value: "rewritten-x-forwarded-port-header",
 						},
 					},
@@ -890,14 +913,16 @@ func (p *Pack) startLeafAppServers(t *testing.T, count int, opts AppTestOptions)
 	return servers
 }
 
-func waitForAppRegInRemoteSiteCache(t *testing.T, tunnel reversetunnel.Server, clusterName string, cfgApps []servicecfg.App, hostUUID string) {
-	require.Eventually(t, func() bool {
+func waitForAppRegInRemoteSiteCache(t *testing.T, tunnel reversetunnelclient.Server, clusterName string, cfgApps []servicecfg.App, hostUUID string) {
+	require.EventuallyWithT(t, func(t *assert.CollectT) {
 		site, err := tunnel.GetSite(clusterName)
-		require.NoError(t, err)
+		assert.NoError(t, err)
+
 		ap, err := site.CachingAccessPoint()
-		require.NoError(t, err)
+		assert.NoError(t, err)
+
 		apps, err := ap.GetApplicationServers(context.Background(), apidefaults.Namespace)
-		require.NoError(t, err)
+		assert.NoError(t, err)
 
 		counter := 0
 		for _, v := range apps {
@@ -905,6 +930,6 @@ func waitForAppRegInRemoteSiteCache(t *testing.T, tunnel reversetunnel.Server, c
 				counter++
 			}
 		}
-		return len(cfgApps) == counter
+		assert.Len(t, cfgApps, counter)
 	}, time.Minute*2, time.Millisecond*200)
 }

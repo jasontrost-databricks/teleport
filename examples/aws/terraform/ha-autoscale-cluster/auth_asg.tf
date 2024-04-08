@@ -57,17 +57,17 @@ resource "aws_launch_template" "auth" {
       region                   = var.region
       locks_table_name         = aws_dynamodb_table.locks.name
       auth_server_addr         = aws_lb.auth.dns_name
+      teleport_auth_type       = var.teleport_auth_type
       cluster_name             = var.cluster_name
       dynamo_table_name        = aws_dynamodb_table.teleport.name
       dynamo_events_table_name = aws_dynamodb_table.teleport_events.name
       email                    = var.email
       domain_name              = var.route53_domain
       s3_bucket                = var.s3_bucket_name
-      influxdb_addr            = "http://${aws_lb.monitor.dns_name}:8086"
       license_path             = var.license_path
-      telegraf_version         = var.telegraf_version
       teleport_uid             = var.teleport_uid
       use_acm                  = var.use_acm
+      use_tls_routing          = var.use_tls_routing
     }
   ))
 

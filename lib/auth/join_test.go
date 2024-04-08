@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package auth
 
@@ -23,16 +25,16 @@ import (
 	"time"
 
 	"github.com/gravitational/trace"
-	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/client/proto"
-	apidefaults "github.com/gravitational/teleport/api/defaults"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	machineidv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/machineid/v1"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
-	"github.com/gravitational/teleport/api/types/wrappers"
 	"github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/lib/auth/machineid/machineidv1"
 	"github.com/gravitational/teleport/lib/auth/testauthority"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/events"
@@ -44,7 +46,6 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 	ctx := context.Background()
 	p, err := newTestPack(ctx, t.TempDir())
 	require.NoError(t, err)
-	a := p.a
 
 	// create a static token
 	staticToken := types.ProvisionTokenV1{
@@ -58,12 +59,22 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 	err = p.a.SetStaticTokens(staticTokens)
 	require.NoError(t, err)
 
-	// create a dynamic token
+	// create a valid dynamic token
 	dynamicToken := generateTestToken(
 		ctx,
 		t,
-		types.SystemRoles{types.RoleNode}, time.Now().Add(time.Minute*30),
-		a,
+		types.SystemRoles{types.RoleNode},
+		p.a.GetClock().Now().Add(time.Minute*30),
+		p.a,
+	)
+
+	// create an expired dynamic token
+	expiredDynamicToken := generateTestToken(
+		ctx,
+		t,
+		types.SystemRoles{types.RoleNode},
+		p.a.GetClock().Now().Add(-time.Minute*30),
+		p.a,
 	)
 
 	sshPrivateKey, sshPublicKey, err := testauthority.New().GenerateKeyPair()
@@ -77,7 +88,6 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 		req              *types.RegisterUsingTokenRequest
 		certsAssertion   func(*proto.Certs)
 		errorAssertion   func(error) bool
-		clock            clockwork.Clock
 		waitTokenDeleted bool // Expired tokens are deleted in background, might need slight delay in relevant test
 	}{
 		{
@@ -217,7 +227,7 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 		{
 			desc: "reject expired dynamic token",
 			req: &types.RegisterUsingTokenRequest{
-				Token:        dynamicToken,
+				Token:        expiredDynamicToken,
 				HostID:       "localhost",
 				NodeName:     "node-name",
 				Role:         types.RoleNode,
@@ -225,37 +235,31 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 				PublicTLSKey: tlsPublicKey,
 			},
 			waitTokenDeleted: true,
-			clock:            clockwork.NewFakeClockAt(time.Now().Add(time.Hour + 1)),
 			errorAssertion:   trace.IsAccessDenied,
 		},
 		{
 			// relies on token being deleted during previous testcase
 			desc: "expired token should be gone",
 			req: &types.RegisterUsingTokenRequest{
-				Token:        dynamicToken,
+				Token:        expiredDynamicToken,
 				HostID:       "localhost",
 				NodeName:     "node-name",
 				Role:         types.RoleNode,
 				PublicSSHKey: sshPublicKey,
 				PublicTLSKey: tlsPublicKey,
 			},
-			clock:          clockwork.NewRealClock(),
 			errorAssertion: trace.IsAccessDenied,
 		},
 	}
 
 	for _, tc := range testcases {
 		t.Run(tc.desc, func(t *testing.T) {
-			if tc.clock == nil {
-				tc.clock = clockwork.NewRealClock()
-			}
-			a.SetClock(tc.clock)
-			certs, err := a.RegisterUsingToken(ctx, tc.req)
+			certs, err := p.a.RegisterUsingToken(ctx, tc.req)
 			if tc.errorAssertion != nil {
 				require.True(t, tc.errorAssertion(err))
 				if tc.waitTokenDeleted {
 					require.Eventually(t, func() bool {
-						_, err := a.ValidateToken(ctx, tc.req.Token)
+						_, err := p.a.ValidateToken(ctx, tc.req.Token)
 						return err != nil && strings.Contains(err.Error(), TokenExpiredOrNotFound)
 					}, time.Millisecond*100, time.Millisecond*10)
 				}
@@ -299,21 +303,23 @@ func TestRegister_Bot(t *testing.T) {
 
 	srv := newTestTLSServer(t)
 
-	botName := "test"
-	botResourceName := BotResourceName(botName)
-
-	_, err := createBotRole(ctx, srv.Auth(), botName, botResourceName, []string{})
-	require.NoError(t, err)
-	_, err = createBotUser(ctx, srv.Auth(), botName, botResourceName, wrappers.Traits{})
+	bot, err := machineidv1.UpsertBot(ctx, srv.Auth(), &machineidv1pb.Bot{
+		Metadata: &headerv1.Metadata{
+			Name: "test",
+		},
+		Spec: &machineidv1pb.BotSpec{
+			Roles: []string{},
+		},
+	}, srv.Clock().Now(), "")
 	require.NoError(t, err)
 
 	later := srv.Clock().Now().Add(4 * time.Hour)
 
-	goodToken := newBotToken(t, "good-token", botName, types.RoleBot, later)
-	expiredToken := newBotToken(t, "expired", botName, types.RoleBot, srv.Clock().Now().Add(-1*time.Hour))
+	goodToken := newBotToken(t, "good-token", bot.Metadata.Name, types.RoleBot, later)
+	expiredToken := newBotToken(t, "expired", bot.Metadata.Name, types.RoleBot, srv.Clock().Now().Add(-1*time.Hour))
 	wrongKind := newBotToken(t, "wrong-kind", "", types.RoleNode, later)
 	wrongUser := newBotToken(t, "wrong-user", "llama", types.RoleBot, later)
-	invalidToken := newBotToken(t, "this-token-does-not-exist", botName, types.RoleBot, later)
+	invalidToken := newBotToken(t, "this-token-does-not-exist", bot.Metadata.Name, types.RoleBot, later)
 
 	err = srv.Auth().UpsertToken(ctx, goodToken)
 	require.NoError(t, err)
@@ -391,15 +397,13 @@ func TestRegister_Bot(t *testing.T) {
 				require.True(t, id.Renewable)
 
 				// Check audit event
-				evts, _, err := srv.Auth().SearchEvents(
-					start,
-					srv.Clock().Now(),
-					apidefaults.Namespace,
-					[]string{events.BotJoinEvent},
-					1,
-					types.EventOrderDescending,
-					"",
-				)
+				evts, _, err := srv.Auth().SearchEvents(ctx, events.SearchEventsRequest{
+					From:       start,
+					To:         srv.Clock().Now(),
+					EventTypes: []string{events.BotJoinEvent},
+					Limit:      1,
+					Order:      types.EventOrderDescending,
+				})
 				require.NoError(t, err)
 				require.Len(t, evts, 1)
 				evt, ok := evts[0].(*apievents.BotJoin)
@@ -456,14 +460,15 @@ func TestRegister_Bot_Expiry(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			botName := t.Name()
-			botResourceName := BotResourceName(botName)
-			_, err := createBotRole(
-				ctx, srv.Auth(), botName, botResourceName, []string{},
-			)
-			require.NoError(t, err)
-			_, err = createBotUser(
-				ctx, srv.Auth(), botName, botResourceName, wrappers.Traits{},
-			)
+			_, err = machineidv1.UpsertBot(ctx, srv.Auth(), &machineidv1pb.Bot{
+				Metadata: &headerv1.Metadata{
+					Name: botName,
+				},
+				Spec: &machineidv1pb.BotSpec{
+					Roles:  []string{},
+					Traits: []*machineidv1pb.Trait{},
+				},
+			}, srv.Clock().Now(), "")
 			require.NoError(t, err)
 			tok := newBotToken(t, t.Name(), botName, types.RoleBot, srv.Clock().Now().Add(time.Hour))
 			require.NoError(t, srv.Auth().UpsertToken(ctx, tok))

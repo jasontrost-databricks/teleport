@@ -4,15 +4,12 @@
     type: dynamodb
     region: {{ required "aws.region is required in chart values" .Values.aws.region }}
     table_name: {{ required "aws.backendTable is required in chart values" .Values.aws.backendTable }}
-    {{- if .Values.aws.auditLogMirrorOnStdout }}
-    audit_events_uri: ['dynamodb://{{ required "aws.auditLogTable is required in chart values" .Values.aws.auditLogTable }}', 'stdout://']
-    {{- else }}
-    audit_events_uri: ['dynamodb://{{ required "aws.auditLogTable is required in chart values" .Values.aws.auditLogTable }}']
-    {{- end }}
+    audit_events_uri: {{- include "teleport-cluster.auth.config.aws.audit" . | nindent 4 }}
     audit_sessions_uri: s3://{{ required "aws.sessionRecordingBucket is required in chart values" .Values.aws.sessionRecordingBucket }}
     continuous_backups: {{ required "aws.backups is required in chart values" .Values.aws.backups }}
     {{- if .Values.aws.dynamoAutoScaling }}
     auto_scaling: true
+    billing_mode: provisioned
     read_min_capacity: {{ required "aws.readMinCapacity is required when aws.dynamoAutoScaling is true" .Values.aws.readMinCapacity }}
     read_max_capacity: {{ required "aws.readMaxCapacity is required when aws.dynamoAutoScaling is true" .Values.aws.readMaxCapacity }}
     read_target_value: {{ required "aws.readTargetValue is required when aws.dynamoAutoScaling is true" .Values.aws.readTargetValue }}
@@ -22,4 +19,27 @@
     {{- else }}
     auto_scaling: false
     {{- end }}
+{{- end -}}
+
+{{- define "teleport-cluster.auth.config.aws.audit" -}}
+  {{- if and .Values.aws.auditLogTable (not .Values.aws.athenaURL) -}}
+- 'dynamodb://{{.Values.aws.auditLogTable}}'
+  {{- else if and (not .Values.aws.auditLogTable) .Values.aws.athenaURL -}}
+- {{ .Values.aws.athenaURL | quote }}
+  {{- else if and .Values.aws.auditLogTable .Values.aws.athenaURL -}}
+    {{- if eq .Values.aws.auditLogPrimaryBackend "dynamo" -}}
+- 'dynamodb://{{.Values.aws.auditLogTable}}'
+- {{ .Values.aws.athenaURL | quote }}
+    {{- else if eq .Values.aws.auditLogPrimaryBackend "athena" -}}
+- {{ .Values.aws.athenaURL | quote }}
+- 'dynamodb://{{.Values.aws.auditLogTable}}'
+    {{- else -}}
+      {{- fail "Both Dynamo and Athena audit backends are enabled. You must specify the primary backend by setting `aws.auditLogPrimaryBackend` to either 'dynamo' or 'athena'." -}}
+    {{- end -}}
+  {{- else -}}
+    {{- fail "You need an audit backend. In AWS mode, you must set at least one of `aws.auditLogTable` (Dynamo) and `aws.athenaURL` (Athena)." -}}
+  {{- end -}}
+  {{- if .Values.aws.auditLogMirrorOnStdout }}
+- 'stdout://'
+  {{- end -}}
 {{- end -}}

@@ -17,10 +17,11 @@ limitations under the License.
 package types
 
 import (
+	"context"
+	"log/slog"
 	"time"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/gravitational/teleport/api/defaults"
@@ -28,8 +29,8 @@ import (
 )
 
 const (
-	githubURL    = "https://github.com"
-	githubAPIURL = "https://api.github.com"
+	GithubURL    = "https://github.com"
+	GithubAPIURL = "https://api.github.com"
 )
 
 // GithubConnector defines an interface for a Github OAuth2 connector
@@ -116,6 +117,16 @@ func (c *GithubConnectorV3) SetResourceID(id int64) {
 	c.Metadata.ID = id
 }
 
+// GetRevision returns the revision
+func (c *GithubConnectorV3) GetRevision() string {
+	return c.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (c *GithubConnectorV3) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
+}
+
 // GetName returns the name of the connector
 func (c *GithubConnectorV3) GetName() string {
 	return c.Metadata.GetName()
@@ -181,7 +192,7 @@ func (c *GithubConnectorV3) CheckAndSetDefaults() error {
 
 	// DELETE IN 11.0.0
 	if len(c.Spec.TeamsToLogins) > 0 {
-		log.Warn("GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
+		slog.WarnContext(context.Background(), "GitHub connector field teams_to_logins is deprecated and will be removed in the next version. Please use teams_to_roles instead.")
 	}
 
 	// make sure claim mappings have either roles or a role template
@@ -269,12 +280,12 @@ func (c *GithubConnectorV3) SetDisplay(display string) {
 
 // GetEndpointURL returns the endpoint URL
 func (c *GithubConnectorV3) GetEndpointURL() string {
-	return githubURL
+	return GithubURL
 }
 
 // GetEndpointURL returns the API endpoint URL
 func (c *GithubConnectorV3) GetAPIEndpointURL() string {
-	return githubAPIURL
+	return GithubAPIURL
 }
 
 // MapClaims returns a list of logins based on the provided claims,

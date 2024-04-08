@@ -1,18 +1,20 @@
 /*
-Copyright 2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package backend
 
@@ -90,6 +92,66 @@ func TestLockConfiguration_CheckAndSetDefaults(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := tt.in
+			err := cfg.CheckAndSetDefaults()
+			if tt.wantErr == "" {
+				require.NoError(t, err, "CheckAndSetDefaults return unexpected err")
+				require.Empty(t, cmp.Diff(tt.want, cfg))
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunWhileLockedConfigCheckAndSetDefaults(t *testing.T) {
+	type mockBackend struct {
+		Backend
+	}
+	lockName := "lock"
+	ttl := 1 * time.Minute
+	minimumValidConfig := RunWhileLockedConfig{
+		LockConfiguration: LockConfiguration{
+			Backend:  mockBackend{},
+			LockName: lockName,
+			TTL:      ttl,
+		},
+	}
+	tests := []struct {
+		name    string
+		input   func() RunWhileLockedConfig
+		want    RunWhileLockedConfig
+		wantErr string
+	}{
+		{
+			name: "minimum valid config",
+			input: func() RunWhileLockedConfig {
+				return minimumValidConfig
+			},
+			want: RunWhileLockedConfig{
+				LockConfiguration: LockConfiguration{
+					Backend:       mockBackend{},
+					LockName:      lockName,
+					TTL:           ttl,
+					RetryInterval: 250 * time.Millisecond,
+				},
+				ReleaseCtxTimeout: time.Second,
+				// defaults to halft of TTL.
+				RefreshLockInterval: 30 * time.Second,
+			},
+		},
+		{
+			name: "errors from LockConfiguration is passed",
+			input: func() RunWhileLockedConfig {
+				cfg := minimumValidConfig
+				cfg.LockName = ""
+				return cfg
+			},
+			wantErr: "missing LockName",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.input()
 			err := cfg.CheckAndSetDefaults()
 			if tt.wantErr == "" {
 				require.NoError(t, err, "CheckAndSetDefaults return unexpected err")

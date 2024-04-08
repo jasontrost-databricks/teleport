@@ -32,11 +32,15 @@ if (!isMac && env.CONNECT_TSH_BIN_PATH === undefined) {
 // Holds tsh.app Info.plist during build. Used in afterPack.
 let tshAppPlist;
 
+// appId must be a reverse DNS string since it's also used as CFBundleURLName on macOS, see
+// protocols.name below.
+const appId = 'gravitational.teleport.connect';
+
 /**
  * @type { import('electron-builder').Configuration }
  */
 module.exports = {
-  appId: 'gravitational.teleport.connect',
+  appId,
   asar: true,
   asarUnpack: '**\\*.{node,dll}',
   afterSign: 'notarize.js',
@@ -54,21 +58,38 @@ module.exports = {
     }
 
     const path = `${packed.appOutDir}/Teleport Connect.app/Contents/MacOS/tsh.app/Contents/Info.plist`;
-    if (packed.appOutDir.endsWith('mac-universal--x64')) {
+    if (packed.appOutDir.endsWith('mac-universal-x64-temp')) {
       tshAppPlist = fs.readFileSync(path);
     }
     if (packed.appOutDir.endsWith('mac-universal')) {
+      if (!tshAppPlist) {
+        throw new Error(
+          'Failed to copy tsh.app Info.plist file from the x64 build. Check if the path "mac-universal-x64-temp" was not changed by electron-builder.'
+        );
+      }
       fs.writeFileSync(path, tshAppPlist);
     }
   },
-  files: [
-    'build/app/dist',
-    // node-pty creates some files that differ across architecture builds causing
-    // the error "can't reconcile the non-macho files" as they cant be combined
-    // with lipo for a universal build. They aren't needed so skip them.
-    '!node_modules/node-pty/build/*/.forge-meta',
-    '!node_modules/node-pty/build/Debug/.deps/**',
-    '!node_modules/node-pty/bin',
+  files: ['build/app'],
+  protocols: [
+    {
+      // name ultimately becomes CFBundleURLName which is the URL identifier. [1] Apple recommends
+      // to set it to a reverse DNS string. [2]
+      //
+      // [1] https://developer.apple.com/documentation/bundleresources/information_property_list/cfbundleurltypes/cfbundleurlname
+      // [2] https://developer.apple.com/documentation/xcode/defining-a-custom-url-scheme-for-your-app#Register-your-URL-scheme
+      name: appId,
+      schemes: ['teleport'],
+      // Not much documentation is available on the role attribute. It ultimately gets mapped to
+      // CFBundleTypeRole in Info.plist.
+      //
+      // It seems that this field is largely related to how macOS thinks of "documents". Since Connect
+      // doesn't let you really edit anything and we won't be passing any docs, let's just set it to
+      // 'Viewer'.
+      //
+      // https://cocoadev.github.io/CFBundleTypeRole/
+      role: 'Viewer',
+    },
   ],
   mac: {
     target: 'dmg',
@@ -103,6 +124,9 @@ module.exports = {
   },
   dmg: {
     artifactName: '${productName}-${version}-${arch}.${ext}',
+    // Turn off blockmaps since we don't support automatic updates.
+    // https://github.com/electron-userland/electron-builder/issues/2900#issuecomment-730571696
+    writeUpdateInfo: false,
     contents: [
       {
         x: 130,
@@ -126,6 +150,11 @@ module.exports = {
         to: './bin/tsh.exe',
       },
     ].filter(Boolean),
+  },
+  nsis: {
+    // Turn off blockmaps since we don't support automatic updates.
+    // https://github.com/electron-userland/electron-builder/issues/2900#issuecomment-730571696
+    differentialPackage: false,
   },
   rpm: {
     artifactName: '${name}-${version}.${arch}.${ext}',

@@ -1,24 +1,27 @@
 /*
-Copyright 2020-2021 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package postgres
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +34,7 @@ import (
 
 	"github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/srv/db/cloud"
 	"github.com/gravitational/teleport/lib/srv/db/common"
@@ -58,10 +62,16 @@ type Engine struct {
 	// cancelReq is a cancel request saved when a cancel request is received
 	// instead of a startup message.
 	cancelReq *pgproto3.CancelRequest
+
+	// rawClientConn is raw, unwrapped network connection to the client
+	rawClientConn net.Conn
+	// rawServerConn is raw, unwrapped network connection to the server
+	rawServerConn net.Conn
 }
 
 // InitializeConnection initializes the client connection.
 func (e *Engine) InitializeConnection(clientConn net.Conn, sessionCtx *common.Session) error {
+	e.rawClientConn = clientConn
 	e.client = pgproto3.NewBackend(pgproto3.NewChunkReader(clientConn), clientConn)
 
 	// The proxy is supposed to pass a startup message it received from
@@ -107,6 +117,7 @@ func toErrorResponse(err error) *pgproto3.ErrorResponse {
 // middleman between the proxy and the database intercepting and interpreting
 // all messages i.e. doing protocol parsing.
 func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Session) error {
+	observe := common.GetConnectionSetupTimeObserver(sessionCtx.Database)
 	// Now we know which database/username the user is connecting to, so
 	// perform an authorization check.
 	err := e.checkAccess(ctx, sessionCtx)
@@ -120,11 +131,26 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 		// 2. The server closes the connection without responding to the client.
 		return trace.Wrap(e.handleCancelRequest(ctx, sessionCtx))
 	}
-	// This is where we connect to the actual Postgres database.
-	server, hijackedConn, err := e.connect(ctx, sessionCtx)
+	// Automatically create the database user if needed.
+	cancelAutoUserLease, err := e.GetUserProvisioner(e).Activate(ctx, sessionCtx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
+	defer func() {
+		err := e.GetUserProvisioner(e).Teardown(ctx, sessionCtx)
+		if err != nil {
+			e.Log.WithError(err).Error("Failed to teardown auto user.")
+		}
+	}()
+	// This is where we connect to the actual Postgres database.
+	server, hijackedConn, err := e.connect(ctx, sessionCtx)
+	if err != nil {
+		cancelAutoUserLease()
+		return trace.Wrap(err)
+	}
+	e.rawServerConn = hijackedConn.Conn
+	// Release the auto-users semaphore now that we've successfully connected.
+	cancelAutoUserLease()
 	// Upon successful connect, indicate to the Postgres client that startup
 	// has been completed, and it can start sending queries.
 	err = e.makeClientReady(e.client, hijackedConn)
@@ -147,12 +173,15 @@ func (e *Engine) HandleConnection(ctx context.Context, sessionCtx *common.Sessio
 			e.Log.WithError(err).Error("Failed to close connection.")
 		}
 	}()
+
+	observe()
+
 	// Now launch the message exchange relaying all intercepted messages b/w
 	// the client (psql or other Postgres client) and the server (database).
 	clientErrCh := make(chan error, 1)
 	serverErrCh := make(chan error, 1)
 	go e.receiveFromClient(e.client, server, clientErrCh, sessionCtx)
-	go e.receiveFromServer(server, e.client, serverConn, serverErrCh, sessionCtx)
+	go e.receiveFromServer(serverConn, serverErrCh, sessionCtx)
 	select {
 	case err := <-clientErrCh:
 		e.Log.WithError(err).Debug("Client done.")
@@ -197,21 +226,23 @@ func (e *Engine) handleStartup(client *pgproto3.Backend, sessionCtx *common.Sess
 }
 
 func (e *Engine) checkAccess(ctx context.Context, sessionCtx *common.Session) error {
+	if err := sessionCtx.CheckUsernameForAutoUserProvisioning(); err != nil {
+		return trace.Wrap(err)
+	}
 	authPref, err := e.Auth.GetAuthPreference(ctx)
 	if err != nil {
 		return trace.Wrap(err)
 	}
-
-	state := sessionCtx.GetAccessState(authPref)
-	dbRoleMatchers := role.DatabaseRoleMatchers(
-		sessionCtx.Database,
-		sessionCtx.DatabaseUser,
-		sessionCtx.DatabaseName,
-	)
+	matchers := role.GetDatabaseRoleMatchers(role.RoleMatchersConfig{
+		Database:       sessionCtx.Database,
+		DatabaseUser:   sessionCtx.DatabaseUser,
+		DatabaseName:   sessionCtx.DatabaseName,
+		AutoCreateUser: sessionCtx.AutoCreateUserMode.IsEnabled(),
+	})
 	err = sessionCtx.Checker.CheckAccess(
 		sessionCtx.Database,
-		state,
-		dbRoleMatchers...,
+		sessionCtx.GetAccessState(authPref),
+		matchers...,
 	)
 	if err != nil {
 		e.Audit.OnSessionStart(e.Context, sessionCtx, err)
@@ -284,6 +315,9 @@ func (e *Engine) makeClientReady(client *pgproto3.Backend, hijackedConn *pgconn.
 func (e *Engine) receiveFromClient(client *pgproto3.Backend, server *pgproto3.Frontend, clientErrCh chan<- error, sessionCtx *common.Session) {
 	log := e.Log.WithField("from", "client")
 	defer log.Debug("Stop receiving from client.")
+
+	ctr := common.GetMessagesFromClientMetric(sessionCtx.Database)
+
 	for {
 		message, err := client.Receive()
 		if err != nil {
@@ -291,7 +325,9 @@ func (e *Engine) receiveFromClient(client *pgproto3.Backend, server *pgproto3.Fr
 			clientErrCh <- err
 			return
 		}
-		log.Debugf("Received client message: %#v.", message)
+		log.Tracef("Received client message: %#v.", message)
+		ctr.Inc()
+
 		switch msg := message.(type) {
 		case *pgproto3.Query:
 			e.auditQueryMessage(sessionCtx, msg)
@@ -368,36 +404,71 @@ func (e *Engine) auditFuncCallMessage(session *common.Session, msg *pgproto3.Fun
 		formatParameters(msg.Arguments, formatCodes)))
 }
 
+// auditUserPermissions calls OnPermissionsUpdate() with appropriate context.
+func (e *Engine) auditUserPermissions(session *common.Session, entries []events.DatabasePermissionEntry) {
+	e.Audit.OnPermissionsUpdate(e.Context, session, entries)
+}
+
 // receiveFromServer receives messages from the provided frontend (which
 // is connected to the database instance) and relays them back to the psql
 // or other client via the provided backend.
-func (e *Engine) receiveFromServer(server *pgproto3.Frontend, client *pgproto3.Backend, serverConn *pgconn.PgConn, serverErrCh chan<- error, sessionCtx *common.Session) {
+func (e *Engine) receiveFromServer(serverConn *pgconn.PgConn, serverErrCh chan<- error, sessionCtx *common.Session) {
 	log := e.Log.WithField("from", "server")
-	defer log.Debug("Stop receiving from server.")
-	for {
-		message, err := server.Receive()
-		if err != nil {
-			if serverConn.IsClosed() {
-				log.Debug("Server connection closed.")
-				serverErrCh <- nil
+	ctr := common.GetMessagesFromServerMetric(sessionCtx.Database)
+
+	// parse and count the messages from the server in a separate goroutine,
+	// operating on a copy of the server message stream. the copy is arranged below.
+	copyReader, copyWriter := io.Pipe()
+	closeChan := make(chan struct{})
+
+	go func() {
+		defer copyReader.Close()
+		defer close(closeChan)
+
+		// server will never be used to write to server,
+		// which is why we pass io.Discard instead of e.rawServerConn
+		server := pgproto3.NewFrontend(pgproto3.NewChunkReader(copyReader), io.Discard)
+
+		var count int64
+		defer func() {
+			log.WithField("parsed_total", count).Debug("Stopped parsing messages from server.")
+		}()
+
+		for {
+			message, err := server.Receive()
+			if err != nil {
+				if serverConn.IsClosed() {
+					log.Debug("Server connection closed.")
+					return
+				}
+				log.WithError(err).Error("Failed to receive message from server.")
 				return
 			}
-			log.WithError(err).Errorf("Failed to receive message from server.")
-			serverErrCh <- err
-			return
+
+			count += 1
+			ctr.Inc()
+			log.Tracef("Received server message: %#v.", message)
 		}
-		log.Debugf("Received server message: %#v.", message)
-		// This is where we would plug in custom logic for particular
-		// messages received from the Postgres server (i.e. emitting
-		// an audit event), but for now just pass them along back to
-		// the client.
-		err = client.Send(message)
-		if err != nil {
-			log.WithError(err).Error("Failed to send message to client.")
-			serverErrCh <- err
-			return
-		}
+	}()
+
+	// the messages are ultimately copied from e.rawServerConn to e.rawClientConn,
+	// but a copy of that message stream is written to a synchronous pipe,
+	// which is read by the analysis goroutine above.
+	total, err := io.Copy(e.rawClientConn, io.TeeReader(e.rawServerConn, copyWriter))
+	if err != nil && !trace.IsConnectionProblem(trace.ConvertSystemError(err)) {
+		log.WithError(err).Warn("Server -> Client copy finished with unexpected error.")
 	}
+
+	// We need to close the writer half of the pipe to notify the analysis
+	// goroutine that the connection is done. This will result in the goroutine
+	// receiving an io.ErrClosedPipe error, which will cause it to finish its
+	// execution. After that, wait until the closeChan is closed to ensure the
+	// goroutine is completed, avoiding data races.
+	copyWriter.Close()
+	<-closeChan
+
+	serverErrCh <- trace.Wrap(err)
+	log.Debugf("Stopped receiving from server. Transferred %v bytes.", total)
 }
 
 // getConnectConfig returns config that can be used to connect to the
@@ -508,7 +579,7 @@ func (e *Engine) handleCancelRequest(ctx context.Context, sessionCtx *common.Ses
 		return trace.Wrap(err)
 	}
 	response := make([]byte, 1)
-	if _, err := tlsConn.Read(response); err != io.EOF {
+	if _, err := tlsConn.Read(response); !errors.Is(err, io.EOF) {
 		// server should close the connection after receiving cancel request.
 		return trace.Wrap(err)
 	}
@@ -539,9 +610,12 @@ func formatParameters(parameters [][]byte, formatCodes []int16) (formatted []str
 	// by "parameter format codes" in the Bind message (0 - text, 1 - binary).
 	//
 	// Be a bit paranoid and make sure that number of format codes matches the
-	// number of parameters, or there are no format codes in which case all
-	// parameters will be text.
-	if len(formatCodes) != 0 && len(formatCodes) != len(parameters) {
+	// number of parameters, or there are zero or one format codes.
+	// zero format codes applies text format to all params.
+	// one format code applies the same format code to all params.
+	// https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-BIND
+	// https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-FUNCTIONCALL
+	if len(formatCodes) > 1 && len(formatCodes) != len(parameters) {
 		logrus.Warnf("Postgres parameter format codes and parameters don't match: %#v %#v.",
 			parameters, formatCodes)
 		return formatted
@@ -550,23 +624,30 @@ func formatParameters(parameters [][]byte, formatCodes []int16) (formatted []str
 		// According to Bind message documentation, if there are no parameter
 		// format codes, it may mean that either there are no parameters, or
 		// that all parameters use default text format.
-		if len(formatCodes) == 0 {
-			formatted = append(formatted, string(p))
-			continue
+		var formatCode int16
+		switch len(formatCodes) {
+		case 0:
+			// use default 0 (text) format for all params.
+		case 1:
+			// apply the same format code to all params.
+			formatCode = formatCodes[0]
+		default:
+			// apply format code corresponding to this param.
+			formatCode = formatCodes[i]
 		}
-		switch formatCodes[i] {
+
+		switch formatCode {
 		case parameterFormatCodeText:
 			// Text parameters can just be converted to their string
 			// representation.
 			formatted = append(formatted, string(p))
 		case parameterFormatCodeBinary:
-			// For binary parameters, just put a placeholder to avoid
-			// spamming the audit log with unreadable info.
-			formatted = append(formatted, "<binary>")
+			// For binary parameters, encode the parameter as a base64 string.
+			formatted = append(formatted, base64.StdEncoding.EncodeToString(p))
 		default:
 			// Should never happen but...
 			logrus.Warnf("Unknown Postgres parameter format code: %#v.",
-				formatCodes[i])
+				formatCode)
 			formatted = append(formatted, "<unknown>")
 		}
 	}

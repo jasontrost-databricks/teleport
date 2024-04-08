@@ -2,32 +2,37 @@
 // +build bpf,!386
 
 /*
-Copyright 2019 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package bpf
 
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	osexec "os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -46,7 +51,89 @@ import (
 	"github.com/gravitational/teleport/lib/cgroup"
 	"github.com/gravitational/teleport/lib/events/eventstest"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
+	"github.com/gravitational/teleport/lib/utils"
 )
+
+const (
+	// reexecInCGroupCmd is a cmd used to re-exec the test binary and call arbitrary program.
+	reexecInCGroupCmd = "reexecCgroup"
+	// networkInCgroupCmd is a cmd used to re-exec the test binary and make HTTP call.
+	networkInCgroupCmd = "networkCgroup"
+)
+
+func TestMain(m *testing.M) {
+	utils.InitLoggerForTests()
+
+	// Check if the re-exec was requested.
+	if len(os.Args) == 3 {
+		var err error
+
+		switch os.Args[1] {
+		case reexecInCGroupCmd:
+			// Get the command to run passed as the 3rd argument.
+			cmd := os.Args[2]
+
+			err = waitAndRun(cmd)
+		case networkInCgroupCmd:
+			// Get the endpoint to call.
+			endpoint := os.Args[2]
+
+			err = callEndpoint(endpoint)
+		default:
+			os.Exit(2)
+		}
+
+		if err != nil {
+			// Something went wrong, exit with error.
+			os.Exit(1)
+		}
+
+		// The rexec was handled and nothing bad happened.
+		os.Exit(0)
+	}
+
+	os.Exit(m.Run())
+}
+
+// waitAndRun wait for continue signal to be generated an executes the
+// passed command and waits until returns.
+func waitAndRun(cmd string) error {
+	if err := waitForContinue(); err != nil {
+		return err
+	}
+
+	return osexec.Command(cmd).Run()
+}
+
+// callEndpoint wait for continue signal to be generated an executes HTTP GET
+// on provided endpoint.
+func callEndpoint(endpoint string) error {
+	if err := waitForContinue(); err != nil {
+		return err
+	}
+
+	resp, err := http.Get(endpoint)
+	if resp != nil {
+		// Close the body to make our linter happy.
+		_ = resp.Body.Close()
+	}
+
+	return err
+}
+
+// waitForContinue opens FD 3 and waits the signal from parent process that
+// the cgroup is being observed and the even can be generated.
+func waitForContinue() error {
+	waitFD := os.NewFile(3, "/proc/self/fd/3")
+	defer waitFD.Close()
+
+	buff := make([]byte, 1)
+	if _, err := waitFD.Read(buff); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+
+	return nil
+}
 
 func TestRootWatch(t *testing.T) {
 	// TODO(jakule): Find a way to run this test in CI. Disable for now to not block all BPF tests.
@@ -68,15 +155,16 @@ func TestRootWatch(t *testing.T) {
 	service, err := New(&servicecfg.BPFConfig{
 		Enabled:    true,
 		CgroupPath: cgroupPath,
-	}, &servicecfg.RestrictedSessionConfig{})
+	})
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		require.NoError(t, service.Close())
+		const restarting = false
+		require.NoError(t, service.Close(restarting))
 	})
 
 	// Create a fake audit log that can be used to capture the events emitted.
-	emitter := &eventstest.MockEmitter{}
+	emitter := &eventstest.MockRecorderEmitter{}
 
 	// Create and start a program that does nothing. Since sleep will run longer
 	// than we wait below, nothing should be emitted to the Audit Log.
@@ -179,7 +267,7 @@ func TestRootObfuscate(t *testing.T) {
 		for {
 			select {
 			case <-ticker.C:
-				runCmd(t, reexecInCGroupCmd, fileName, execsnoop)
+				runCmd(t, reexecInCGroupCmd, fileName, execsnoop, require.NoError)
 			case <-done:
 				return
 			}
@@ -242,7 +330,7 @@ func TestRootScript(t *testing.T) {
 				return
 			case <-ticker.C:
 				// Run script in a cgroup.
-				runCmd(t, reexecInCGroupCmd, fileName, execsnoop)
+				runCmd(t, reexecInCGroupCmd, fileName, execsnoop, require.NoError)
 			}
 		}
 	}()
@@ -302,7 +390,7 @@ func TestRootPrograms(t *testing.T) {
 
 	// Loop over all three programs and make sure events are received off the
 	// perf buffer.
-	var tests = []struct {
+	tests := []struct {
 		inName    string
 		inEventCh <-chan []byte
 		genEvents func(t *testing.T, ctx context.Context)
@@ -435,6 +523,72 @@ func TestRootBPFCounter(t *testing.T) {
 	counter.Close()
 }
 
+// TestRootLargeCommands given commands with higher amount of characters
+// (length), ensure the command events are generated correctly.
+func TestRootLargeCommands(t *testing.T) {
+	t.Skip("flaky test, disable now")
+	// This test must be run as root and the host has to be capable of running
+	// BPF programs.
+	if !bpfTestEnabled() {
+		t.Skip("BPF testing is disabled")
+	}
+	if !isRoot() {
+		t.Skip("Tests for package bpf can only be run as root.")
+	}
+
+	for name, test := range map[string]struct {
+		cmd               string
+		expectPartialPath bool
+	}{
+		"large command": {
+			cmd: "/random" + strings.Repeat("random", 128/len("random")),
+		},
+		"command exceed max size": {
+			cmd:               "/random" + strings.Repeat("random", ArgvMax/len("random")),
+			expectPartialPath: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Start execsnoop.
+			execsnoop, err := startExec(8)
+			defer execsnoop.close()
+			require.NoError(t, err)
+
+			// Since we're using a random command, we should expect its
+			// execution will fail.
+			runCmd(t, reexecInCGroupCmd, test.cmd, execsnoop, require.Error)
+
+			for {
+				select {
+				case eventBytes := <-execsnoop.events():
+					var event rawExecEvent
+					err := unmarshalEvent(eventBytes, &event)
+					require.NoError(t, err)
+
+					// Since we're executing the command using the test binary,
+					// the arguments return on a single event, and the path of
+					// or command will come on the argv part.
+					argv := ConvertString(unsafe.Pointer(&event.Argv))
+					if event.Type == eventArg {
+						if test.expectPartialPath {
+							require.Len(t, argv, ArgvMax)
+							require.True(t, strings.HasPrefix(test.cmd, argv), "expected command to have same content until cap")
+							return
+						} else {
+							require.Equal(t, test.cmd, argv)
+							return
+						}
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatalf("Timed out waiting for an event.")
+					return
+				}
+			}
+		})
+	}
+
+}
+
 // waitForEvent will wait for an event to arrive over the perf buffer and
 // signal when it has.
 func waitForEvent(ctx context.Context, cancel context.CancelFunc, eventCh <-chan []byte, verifyFn func(event []byte) bool) {
@@ -463,7 +617,8 @@ func moveIntoCgroup(t *testing.T, pid int) (uint64, error) {
 		return 0, trace.Wrap(err)
 	}
 	t.Cleanup(func() {
-		require.NoError(t, cgroupSrv.Close())
+		const skipUnmount = false
+		require.NoError(t, cgroupSrv.Close(skipUnmount))
 	})
 
 	sessionID := uuid.New().String()
@@ -526,14 +681,14 @@ func executeCommand(t *testing.T, doneContext context.Context, file string,
 			fullPath, err := osexec.LookPath(path)
 			require.NoError(t, err)
 
-			runCmd(t, reexecInCGroupCmd, fullPath, traceCgroup)
+			runCmd(t, reexecInCGroupCmd, fullPath, traceCgroup, require.NoError)
 		case <-doneContext.Done():
 			return
 		}
 	}
 }
 
-func runCmd(t *testing.T, reexecCmd string, arg string, traceCgroup cgroupRegister) {
+func runCmd(t *testing.T, reexecCmd string, arg string, traceCgroup cgroupRegister, cmdReturnAssertion require.ErrorAssertionFunc) {
 	t.Helper()
 
 	// Create a pipe to communicate with the child process after re-exec.
@@ -566,7 +721,7 @@ func runCmd(t *testing.T, reexecCmd string, arg string, traceCgroup cgroupRegist
 	require.NoError(t, err)
 
 	// Wait for the command to exit. Otherwise, we cannot clean up the cgroup.
-	require.NoError(t, cmd.Wait())
+	cmdReturnAssertion(t, cmd.Wait())
 
 	// Remove the registered cgroup from the BPF module. Do not call it after
 	// BPF module is deregistered.
@@ -589,7 +744,7 @@ func executeHTTP(t *testing.T, doneContext context.Context, endpoint string, tra
 				t.Logf("HTTP request failed: %v.", err)
 			}
 
-			runCmd(t, networkInCgroupCmd, endpoint, traceCgroup)
+			runCmd(t, networkInCgroupCmd, endpoint, traceCgroup, require.NoError)
 
 		case <-doneContext.Done():
 			return

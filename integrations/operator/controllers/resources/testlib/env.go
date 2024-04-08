@@ -1,16 +1,20 @@
-// Copyright 2023 Gravitational, Inc
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//      http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package testlib
 
@@ -27,14 +31,18 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap/zapcore"
 	core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/rest"
-	"k8s.io/kubectl/pkg/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/gravitational/teleport/api/client"
 	"github.com/gravitational/teleport/api/types"
@@ -43,10 +51,23 @@ import (
 	resourcesv2 "github.com/gravitational/teleport/integrations/operator/apis/resources/v2"
 	resourcesv3 "github.com/gravitational/teleport/integrations/operator/apis/resources/v3"
 	resourcesv5 "github.com/gravitational/teleport/integrations/operator/apis/resources/v5"
+	"github.com/gravitational/teleport/integrations/operator/controllers"
 	"github.com/gravitational/teleport/integrations/operator/controllers/resources"
 	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 )
+
+// scheme is our own test-specific scheme to avoid using the global
+// unprotected scheme.Scheme that triggers the race detector
+var scheme = controllers.Scheme
+
+func init() {
+	utilruntime.Must(core.AddToScheme(scheme))
+	utilruntime.Must(resourcesv1.AddToScheme(scheme))
+	utilruntime.Must(resourcesv2.AddToScheme(scheme))
+	utilruntime.Must(resourcesv3.AddToScheme(scheme))
+	utilruntime.Must(resourcesv5.AddToScheme(scheme))
+}
 
 func createNamespaceForTest(t *testing.T, kc kclient.Client) *core.Namespace {
 	ns := &core.Namespace{
@@ -102,11 +123,18 @@ func defaultTeleportServiceConfig(t *testing.T) (*helpers.TeleInstance, string) 
 	unrestricted := []string{"list", "create", "read", "update", "delete"}
 	role, err := types.NewRole(roleName, types.RoleSpecV6{
 		Allow: types.RoleConditions{
+			// the operator has wildcard noe labs to be able to see them
+			// but has no login allowed, so it cannot SSH into them
+			NodeLabels: types.Labels{"*": []string{"*"}},
 			Rules: []types.Rule{
-				types.NewRule("role", unrestricted),
-				types.NewRule("user", unrestricted),
-				types.NewRule("auth_connector", unrestricted),
-				types.NewRule("login_rule", unrestricted),
+				types.NewRule(types.KindRole, unrestricted),
+				types.NewRule(types.KindUser, unrestricted),
+				types.NewRule(types.KindAuthConnector, unrestricted),
+				types.NewRule(types.KindLoginRule, unrestricted),
+				types.NewRule(types.KindToken, unrestricted),
+				types.NewRule(types.KindOktaImportRule, unrestricted),
+				types.NewRule(types.KindAccessList, unrestricted),
+				types.NewRule(types.KindNode, unrestricted),
 			},
 		},
 	})
@@ -125,6 +153,10 @@ func FastEventually(t *testing.T, condition func() bool) {
 	require.Eventually(t, condition, time.Second, 100*time.Millisecond)
 }
 
+func FastEventuallyWithT(t *testing.T, condition func(collectT *assert.CollectT)) {
+	require.EventuallyWithT(t, condition, time.Second, 100*time.Millisecond)
+}
+
 func clientForTeleport(t *testing.T, teleportServer *helpers.TeleInstance, userName string) *client.Client {
 	identityFilePath := helpers.MustCreateUserIdentityFile(t, teleportServer, userName, time.Hour)
 	creds := client.LoadIdentityFile(identityFilePath)
@@ -141,13 +173,14 @@ func clientWithCreds(t *testing.T, authAddr string, creds client.Credentials) *c
 }
 
 type TestSetup struct {
-	TeleportClient *client.Client
-	K8sClient      kclient.Client
-	K8sRestConfig  *rest.Config
-	Namespace      *core.Namespace
-	Operator       manager.Manager
-	OperatorCancel context.CancelFunc
-	OperatorName   string
+	TeleportClient           *client.Client
+	K8sClient                kclient.Client
+	K8sRestConfig            *rest.Config
+	Namespace                *core.Namespace
+	Operator                 manager.Manager
+	OperatorCancel           context.CancelFunc
+	OperatorName             string
+	stepByStepReconciliation bool
 }
 
 // StartKubernetesOperator creates and start a new operator
@@ -157,37 +190,20 @@ func (s *TestSetup) StartKubernetesOperator(t *testing.T) {
 		s.StopKubernetesOperator()
 	}
 
-	// We have to create a new Manager on each start because the Manager does not support to be restarted
-	clientAccessor := func(ctx context.Context) (*client.Client, error) {
-		return s.TeleportClient, nil
-	}
-
 	k8sManager, err := ctrl.NewManager(s.K8sRestConfig, ctrl.Options{
-		Scheme:             scheme.Scheme,
-		MetricsBindAddress: "0",
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+		// We enable cache to ensure the tests are close to how the manager is created when running in a real cluster
+		Client: ctrlclient.Options{Cache: &ctrlclient.CacheOptions{Unstructured: true}},
 	})
 	require.NoError(t, err)
 
-	err = (&resources.RoleReconciler{
-		Client:                 s.K8sClient,
-		Scheme:                 k8sManager.GetScheme(),
-		TeleportClientAccessor: clientAccessor,
-	}).SetupWithManager(k8sManager)
-	require.NoError(t, err)
+	setupLog := ctrl.Log.WithName("setup")
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.Level(zapcore.DebugLevel)))
 
-	err = resources.NewUserReconciler(s.K8sClient, clientAccessor).SetupWithManager(k8sManager)
+	pong, err := s.TeleportClient.Ping(context.Background())
 	require.NoError(t, err)
-
-	err = resources.NewGithubConnectorReconciler(s.K8sClient, clientAccessor).SetupWithManager(k8sManager)
-	require.NoError(t, err)
-
-	err = resources.NewOIDCConnectorReconciler(s.K8sClient, clientAccessor).SetupWithManager(k8sManager)
-	require.NoError(t, err)
-
-	err = resources.NewSAMLConnectorReconciler(s.K8sClient, clientAccessor).SetupWithManager(k8sManager)
-	require.NoError(t, err)
-
-	err = resources.NewLoginRuleReconciler(s.K8sClient, clientAccessor).SetupWithManager(k8sManager)
+	err = resources.SetupAllControllers(setupLog, k8sManager, s.TeleportClient, pong.ServerFeatures)
 	require.NoError(t, err)
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
@@ -244,6 +260,10 @@ func WithTeleportClient(clt *client.Client) TestOption {
 	}
 }
 
+func StepByStep(setup *TestSetup) {
+	setup.stepByStepReconciliation = true
+}
+
 // SetupTestEnv creates a Kubernetes server, a teleport server and starts the operator
 func SetupTestEnv(t *testing.T, opts ...TestOption) *TestSetup {
 	// Hack to get the path of this file in order to find the crd path no matter
@@ -259,19 +279,7 @@ func SetupTestEnv(t *testing.T, opts ...TestOption) *TestSetup {
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	err = resourcesv1.AddToScheme(scheme.Scheme)
-	require.NoError(t, err)
-
-	err = resourcesv5.AddToScheme(scheme.Scheme)
-	require.NoError(t, err)
-
-	err = resourcesv2.AddToScheme(scheme.Scheme)
-	require.NoError(t, err)
-
-	err = resourcesv3.AddToScheme(scheme.Scheme)
-	require.NoError(t, err)
-
-	k8sClient, err := kclient.New(cfg, kclient.Options{Scheme: scheme.Scheme})
+	k8sClient, err := kclient.New(cfg, kclient.Options{Scheme: scheme})
 	require.NoError(t, err)
 	require.NotNil(t, k8sClient)
 
@@ -295,12 +303,14 @@ func SetupTestEnv(t *testing.T, opts ...TestOption) *TestSetup {
 
 	setupTeleportClient(t, setup)
 
-	// Create and start the Kubernetes operator
-	setup.StartKubernetesOperator(t)
-
-	t.Cleanup(func() {
-		setup.StopKubernetesOperator()
-	})
+	// If the test wants to do step by step reconciliation, we don't start
+	// an operator in the background.
+	if !setup.stepByStepReconciliation {
+		setup.StartKubernetesOperator(t)
+		t.Cleanup(func() {
+			setup.StopKubernetesOperator()
+		})
+	}
 
 	return setup
 }

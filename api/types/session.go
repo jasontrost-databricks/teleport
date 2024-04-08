@@ -21,9 +21,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/gravitational/trace"
-
-	"github.com/gravitational/teleport/api/defaults"
 )
 
 // WebSessionsGetter provides access to web sessions
@@ -96,6 +95,16 @@ type WebSession interface {
 	SetSAMLSession(*SAMLSessionData)
 	// GetSAMLSession gets the SAML session data. Is considered secret.
 	GetSAMLSession() *SAMLSessionData
+	// SetDeviceWebToken sets the session's DeviceWebToken.
+	// The token is considered a secret.
+	SetDeviceWebToken(*DeviceWebToken)
+	// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+	// The token is considered a secret.
+	GetDeviceWebToken() *DeviceWebToken
+	// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+	// If true the session's TLS and SSH certificates are augmented with device
+	// extensions.
+	GetHasDeviceExtensions() bool
 }
 
 // NewWebSession returns new instance of the web session based on the V2 spec
@@ -169,16 +178,35 @@ func (ws *WebSessionV2) SetResourceID(id int64) {
 	ws.Metadata.SetID(id)
 }
 
+// GetRevision returns the revision
+func (ws *WebSessionV2) GetRevision() string {
+	return ws.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (ws *WebSessionV2) SetRevision(rev string) {
+	ws.Metadata.SetRevision(rev)
+}
+
 // GetIdleTimeout returns the max idle timeout duration.
 func (ws *WebSessionV2) GetIdleTimeout() time.Duration {
 	return ws.Spec.IdleTimeout.Duration()
 }
 
-// WithoutSecrets returns copy of the object but without secrets
+// WithoutSecrets returns a copy of the WebSession without secrets.
 func (ws *WebSessionV2) WithoutSecrets() WebSession {
-	ws.Spec.Priv = nil
-	ws.Spec.SAMLSession = nil
-	return ws
+	// With gogoproto, proto.Clone and proto.Merge panic with
+	// nonnullabe stdtime types unless they are in UTC.
+	// https://github.com/gogo/protobuf/issues/519
+	ws.Spec.Expires = ws.Spec.Expires.UTC()
+	ws.Spec.LoginTime = ws.Spec.LoginTime.UTC()
+	ws.Spec.BearerTokenExpires = ws.Spec.BearerTokenExpires.UTC()
+
+	cp := proto.Clone(ws).(*WebSessionV2)
+	cp.Spec.Priv = nil
+	cp.Spec.SAMLSession = nil
+	cp.Spec.DeviceWebToken = nil
+	return cp
 }
 
 // SetConsumedAccessRequestID sets the ID of the access request from which additional roles to assume were obtained.
@@ -201,6 +229,25 @@ func (ws *WebSessionV2) GetSAMLSession() *SAMLSessionData {
 	return ws.Spec.SAMLSession
 }
 
+// SetDeviceWebToken sets the session's DeviceWebToken.
+// The token is considered a secret.
+func (ws *WebSessionV2) SetDeviceWebToken(webToken *DeviceWebToken) {
+	ws.Spec.DeviceWebToken = webToken
+}
+
+// GetDeviceWebToken returns the session's DeviceWebToken, if any.
+// The token is considered a secret.
+func (ws *WebSessionV2) GetDeviceWebToken() *DeviceWebToken {
+	return ws.Spec.DeviceWebToken
+}
+
+// GetHasDeviceExtensions returns the HasDeviceExtensions value.
+// If true the session's TLS and SSH certificates are augmented with device
+// extensions.
+func (ws *WebSessionV2) GetHasDeviceExtensions() bool {
+	return ws.Spec.HasDeviceExtensions
+}
+
 // setStaticFields sets static resource header and metadata fields.
 func (ws *WebSessionV2) setStaticFields() {
 	ws.Version = V2
@@ -213,7 +260,6 @@ func (ws *WebSessionV2) CheckAndSetDefaults() error {
 	if err := ws.Metadata.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
-
 	if ws.Spec.User == "" {
 		return trace.BadParameter("missing User")
 	}
@@ -337,38 +383,6 @@ func (r *GetSAMLIdPSessionRequest) Check() error {
 	if r.SessionID == "" {
 		return trace.BadParameter("session ID missing")
 	}
-	return nil
-}
-
-// CreateAppSessionRequest contains the parameters needed to request
-// creating an application web session.
-type CreateAppSessionRequest struct {
-	// Username is the identity of the user requesting the session.
-	Username string `json:"username"`
-	// PublicAddr is the public address of the application.
-	PublicAddr string `json:"public_addr"`
-	// ClusterName is the name of the cluster within which the application is running.
-	ClusterName string `json:"cluster_name"`
-	// AWSRoleARN is AWS role this the user wants to assume.
-	AWSRoleARN string `json:"aws_role_arn"`
-	// AzureIdentity is Azure identity this the user wants to assume.
-	AzureIdentity string `json:"azure_identity"`
-	// GCPServiceAccount is GCP service account this the user wants to assume.
-	GCPServiceAccount string `json:"gcp_service_account"`
-}
-
-// Check validates the request.
-func (r CreateAppSessionRequest) Check() error {
-	if r.Username == "" {
-		return trace.BadParameter("username missing")
-	}
-	if r.PublicAddr == "" {
-		return trace.BadParameter("public address missing")
-	}
-	if r.ClusterName == "" {
-		return trace.BadParameter("cluster name missing")
-	}
-
 	return nil
 }
 
@@ -527,6 +541,16 @@ func (r *WebTokenV3) SetResourceID(id int64) {
 	r.Metadata.SetID(id)
 }
 
+// GetRevision returns the revision
+func (r *WebTokenV3) GetRevision() string {
+	return r.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (r *WebTokenV3) SetRevision(rev string) {
+	r.Metadata.SetRevision(rev)
+}
+
 // GetToken returns the token value
 func (r *WebTokenV3) GetToken() string {
 	return r.Spec.Token
@@ -586,45 +610,6 @@ func (r *WebTokenV3) CheckAndSetDefaults() error {
 func (r *WebTokenV3) String() string {
 	return fmt.Sprintf("WebToken(kind=%v,user=%v,token=%v,expires=%v)",
 		r.GetKind(), r.GetUser(), r.GetToken(), r.Expiry())
-}
-
-// CheckAndSetDefaults validates the request and sets defaults.
-func (r *NewWebSessionRequest) CheckAndSetDefaults() error {
-	if r.User == "" {
-		return trace.BadParameter("user name required")
-	}
-	if len(r.Roles) == 0 {
-		return trace.BadParameter("roles required")
-	}
-	if len(r.Traits) == 0 {
-		return trace.BadParameter("traits required")
-	}
-	if r.SessionTTL == 0 {
-		r.SessionTTL = defaults.CertDuration
-	}
-	return nil
-}
-
-// NewWebSessionRequest defines a request to create a new user
-// web session
-type NewWebSessionRequest struct {
-	// User specifies the user this session is bound to
-	User string
-	// LoginIP is an observed IP of the client, it will be embedded into certificates.
-	LoginIP string
-	// Roles optionally lists additional user roles
-	Roles []string
-	// Traits optionally lists role traits
-	Traits map[string][]string
-	// SessionTTL optionally specifies the session time-to-live.
-	// If left unspecified, the default certificate duration is used.
-	SessionTTL time.Duration
-	// LoginTime is the time that this user recently logged in.
-	LoginTime time.Time
-	// AccessRequests contains the UUIDs of the access requests currently in use.
-	AccessRequests []string
-	// RequestedResourceIDs optionally lists requested resources
-	RequestedResourceIDs []ResourceID
 }
 
 // Check validates the request.

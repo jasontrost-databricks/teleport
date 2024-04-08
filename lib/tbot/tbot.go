@@ -1,112 +1,96 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package tbot
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"sync"
 	"time"
 
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 
+	"github.com/gravitational/teleport"
 	"github.com/gravitational/teleport/api/client/proto"
 	"github.com/gravitational/teleport/api/client/webclient"
+	"github.com/gravitational/teleport/api/metadata"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
+	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/modules"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/tbot/config"
 	"github.com/gravitational/teleport/lib/tbot/identity"
 	"github.com/gravitational/teleport/lib/utils"
 )
 
-type Bot struct {
-	cfg        *config.BotConfig
-	log        logrus.FieldLogger
-	reloadChan chan struct{}
-	modules    modules.Modules
+var tracer = otel.Tracer("github.com/gravitational/teleport/lib/tbot")
 
-	// These are protected by getter/setters with mutex locks
-	mu         sync.Mutex
-	_client    auth.ClientI
-	_ident     *identity.Identity
-	_authPong  *proto.PingResponse
-	_proxyPong *webclient.PingResponse
-	_cas       map[types.CertAuthType][]types.CertAuthority
-	started    bool
+const componentTBot = "tbot"
+
+// Service is a long-running sub-component of tbot.
+type Service interface {
+	// String returns a human-readable name for the service that can be used
+	// in logging. It should identify the type of the service and any top
+	// level configuration that could distinguish it from a same-type service.
+	String() string
+	// Run starts the service and blocks until the service exits. It should
+	// return a nil error if the service exits successfully and an error
+	// if it is unable to proceed. It should exit gracefully if the context
+	// is canceled.
+	Run(ctx context.Context) error
 }
 
-func New(cfg *config.BotConfig, log logrus.FieldLogger, reloadChan chan struct{}) *Bot {
+// OneShotService is a [Service] that offers a mode in which it runs a single
+// time and then exits. This aligns with the `--oneshot` mode of tbot.
+type OneShotService interface {
+	Service
+	// OneShot runs the service once and then exits. It should return a nil
+	// error if the service exits successfully and an error if it is unable
+	// to proceed. It should exit gracefully if the context is canceled.
+	OneShot(ctx context.Context) error
+}
+
+type Bot struct {
+	cfg     *config.BotConfig
+	log     logrus.FieldLogger
+	modules modules.Modules
+
+	mu             sync.Mutex
+	started        bool
+	botIdentitySvc *identityService
+}
+
+func New(cfg *config.BotConfig, log logrus.FieldLogger) *Bot {
 	if log == nil {
 		log = utils.NewLogger()
 	}
 
 	return &Bot{
-		cfg:        cfg,
-		log:        log,
-		reloadChan: reloadChan,
-		modules:    modules.GetModules(),
-
-		_cas: map[types.CertAuthType][]types.CertAuthority{},
+		cfg:     cfg,
+		log:     log,
+		modules: modules.GetModules(),
 	}
-}
-
-// Config returns the current bot config
-func (b *Bot) Config() *config.BotConfig {
-	return b.cfg
-}
-
-// Client retrieves the current auth client.
-func (b *Bot) Client() auth.ClientI {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b._client
-}
-
-func (b *Bot) setClient(client auth.ClientI) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Make sure the previous client is closed.
-	if b._client != nil {
-		_ = b._client.Close()
-	}
-
-	b._client = client
-}
-
-func (b *Bot) ident() *identity.Identity {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b._ident
-}
-
-func (b *Bot) setIdent(ident *identity.Identity) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b._ident = ident
 }
 
 func (b *Bot) markStarted() error {
@@ -121,115 +105,24 @@ func (b *Bot) markStarted() error {
 	return nil
 }
 
-// certAuthorities returns cached CAs of the given type.
-func (b *Bot) certAuthorities(caType types.CertAuthType) []types.CertAuthority {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+type getBotIdentityFn func() *identity.Identity
 
-	return b._cas[caType]
-}
-
-// clearCertAuthorities purges the CA cache. This should be run at least as
-// frequently as CAs are rotated.
-func (b *Bot) clearCertAuthorities() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b._cas = map[types.CertAuthType][]types.CertAuthority{}
-}
-
-// GetCertAuthorities returns the possibly cached CAs of the given type and
-// requests them from the server if unavailable.
-func (b *Bot) GetCertAuthorities(ctx context.Context, caType types.CertAuthType) ([]types.CertAuthority, error) {
-	if cas := b.certAuthorities(caType); len(cas) > 0 {
-		return cas, nil
-	}
-
-	cas, err := b.Client().GetCertAuthorities(ctx, caType, false)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b._cas[caType] = cas
-	return cas, nil
-}
-
-// authPong returns the last ping response from the auth server. It may be nil
-// if no ping has succeeded.
-func (b *Bot) authPong() *proto.PingResponse {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b._authPong
-}
-
-// AuthPing pings the auth server and returns the (possibly cached) response.
-func (b *Bot) AuthPing(ctx context.Context) (*proto.PingResponse, error) {
-	if authPong := b.authPong(); authPong != nil {
-		return authPong, nil
-	}
-
-	pong, err := b.Client().Ping(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b._authPong = &pong
-
-	return &pong, nil
-}
-
-// proxyPong returns the last proxy ping response. It may be nil if no proxy
-// ping has succeeded.
-func (b *Bot) proxyPong() *webclient.PingResponse {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	return b._proxyPong
-}
-
-// ProxyPing returns a (possibly cached) ping response from the Teleport proxy.
-// Note that it relies on the auth server being configured with a sane proxy
-// public address.
-func (b *Bot) ProxyPing(ctx context.Context) (*webclient.PingResponse, error) {
-	if proxyPong := b.proxyPong(); proxyPong != nil {
-		return proxyPong, nil
-	}
-
-	// Note: this relies on the auth server's proxy address. We could
-	// potentially support some manual parameter here in the future if desired.
-	authPong, err := b.AuthPing(ctx)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	proxyPong, err := webclient.Ping(&webclient.Config{
-		Context:   ctx,
-		ProxyAddr: authPong.ProxyPublicAddr,
-	})
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b._proxyPong = proxyPong
-
-	return proxyPong, nil
+// BotIdentity returns the bot's own identity. This will return nil if the bot
+// has not been started.
+func (b *Bot) BotIdentity() *identity.Identity {
+	return b.botIdentitySvc.GetIdentity()
 }
 
 func (b *Bot) Run(ctx context.Context) error {
+	ctx, span := tracer.Start(ctx, "Bot/Run")
+	defer span.End()
+
 	if err := b.markStarted(); err != nil {
 		return trace.Wrap(err)
 	}
-
-	unlock, err := b.initialize(ctx)
+	unlock, err := b.preRunChecks(ctx)
 	defer func() {
+		b.log.Debug("Unlocking bot storage.")
 		if unlock != nil {
 			if err := unlock(); err != nil {
 				b.log.WithError(err).Warn("Failed to release lock. Future starts of tbot may fail.")
@@ -240,33 +133,213 @@ func (b *Bot) Run(ctx context.Context) error {
 		return trace.Wrap(err)
 	}
 
-	// Maintain a context that we can cancel if the bot is running in one shot.
-	ctx, cancel := context.WithCancel(ctx)
+	addr, _ := b.cfg.Address()
+	resolver, err := reversetunnelclient.CachingResolver(
+		ctx,
+		reversetunnelclient.WebClientResolver(&webclient.Config{
+			Context:   ctx,
+			ProxyAddr: addr,
+			Insecure:  b.cfg.Insecure,
+		}),
+		nil /* clock */)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// Create an error group to manage all the services lifetimes.
 	eg, egCtx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		return trace.Wrap(b.caRotationLoop(egCtx))
-	})
-	eg.Go(func() error {
-		err := b.renewLoop(egCtx)
-		if err != nil {
-			return trace.Wrap(err)
+	var services []Service
+
+	// ReloadBroadcaster allows multiple entities to trigger a reload of
+	// all services. This allows os signals and other events such as CA
+	// rotations to trigger appropriate renewals.
+	reloadBroadcaster := &channelBroadcaster{
+		chanSet: map[chan struct{}]struct{}{},
+	}
+	// Trigger reloads from an configured reload channel.
+	if b.cfg.ReloadCh != nil {
+		// We specifically do not use the error group here as we do not want
+		// this goroutine to block the bot from exiting.
+		go func() {
+			for {
+				select {
+				case <-egCtx.Done():
+					return
+				case <-b.cfg.ReloadCh:
+					reloadBroadcaster.broadcast()
+				}
+			}
+		}()
+	}
+
+	b.botIdentitySvc = &identityService{
+		cfg:               b.cfg,
+		reloadBroadcaster: reloadBroadcaster,
+		resolver:          resolver,
+		log: b.log.WithField(
+			teleport.ComponentKey, teleport.Component(componentTBot, "identity"),
+		),
+	}
+	// Initialize bot's own identity. This will load from disk, or fetch a new
+	// identity, and perform an initial renewal if necessary.
+	if err := b.botIdentitySvc.Initialize(ctx); err != nil {
+		return trace.Wrap(err)
+	}
+	defer func() {
+		if err := b.botIdentitySvc.Close(); err != nil {
+			b.log.WithError(err).Error("Failed to close bot identity service")
 		}
-		// If `renewLoop` exits with nil, the bot is running in "one-shot", so
-		// we should indicate to other long-running processes that they can
-		// finish up.
-		cancel()
-		return nil
+	}()
+	services = append(services, b.botIdentitySvc)
+
+	authPingCache := &authPingCache{
+		client: b.botIdentitySvc.GetClient(),
+		log:    b.log,
+	}
+	proxyPingCache := &proxyPingCache{
+		authPingCache: authPingCache,
+		botCfg:        b.cfg,
+		log:           b.log,
+	}
+
+	// Setup all other services
+	if b.cfg.DiagAddr != "" {
+		services = append(services, &diagnosticsService{
+			diagAddr:     b.cfg.DiagAddr,
+			pprofEnabled: b.cfg.Debug,
+			log: b.log.WithField(
+				teleport.ComponentKey, teleport.Component(componentTBot, "diagnostics"),
+			),
+		})
+	}
+	services = append(services, &outputsService{
+		authPingCache:  authPingCache,
+		proxyPingCache: proxyPingCache,
+		getBotIdentity: b.botIdentitySvc.GetIdentity,
+		botClient:      b.botIdentitySvc.GetClient(),
+		cfg:            b.cfg,
+		resolver:       resolver,
+		log: b.log.WithField(
+			teleport.ComponentKey, teleport.Component(componentTBot, "outputs"),
+		),
+		reloadBroadcaster: reloadBroadcaster,
 	})
+	services = append(services, &caRotationService{
+		getBotIdentity: b.botIdentitySvc.GetIdentity,
+		botClient:      b.botIdentitySvc.GetClient(),
+		log: b.log.WithField(
+			teleport.ComponentKey, teleport.Component(componentTBot, "ca-rotation"),
+		),
+		reloadBroadcaster: reloadBroadcaster,
+	})
+
+	// Append any services configured by the user
+	for _, svcCfg := range b.cfg.Services {
+		// Convert the service config into the actual service type.
+		switch svcCfg := svcCfg.(type) {
+		case *config.SPIFFEWorkloadAPIService:
+			// Create a credential output for the SPIFFE Workload API service to
+			// use as a source of an impersonated identity.
+			svcIdentity := &config.UnstableClientCredentialOutput{}
+			b.cfg.Outputs = append(b.cfg.Outputs, svcIdentity)
+
+			svc := &SPIFFEWorkloadAPIService{
+				botClient:             b.botIdentitySvc.GetClient(),
+				svcIdentity:           svcIdentity,
+				botCfg:                b.cfg,
+				cfg:                   svcCfg,
+				resolver:              resolver,
+				rootReloadBroadcaster: reloadBroadcaster,
+				trustBundleBroadcast: &channelBroadcaster{
+					chanSet: map[chan struct{}]struct{}{},
+				},
+			}
+			svc.log = b.log.WithField(
+				teleport.ComponentKey, teleport.Component(componentTBot, "svc", svc.String()),
+			)
+			services = append(services, svc)
+		case *config.DatabaseTunnelService:
+			svc := &DatabaseTunnelService{
+				getBotIdentity: b.botIdentitySvc.GetIdentity,
+				proxyPingCache: proxyPingCache,
+				botClient:      b.botIdentitySvc.GetClient(),
+				resolver:       resolver,
+				botCfg:         b.cfg,
+				cfg:            svcCfg,
+			}
+			svc.log = b.log.WithField(
+				teleport.ComponentKey, teleport.Component(componentTBot, "svc", svc.String()),
+			)
+			services = append(services, svc)
+		case *config.ExampleService:
+			services = append(services, &ExampleService{
+				cfg: svcCfg,
+			})
+		default:
+			return trace.BadParameter("unknown service type: %T", svcCfg)
+		}
+	}
+
+	b.log.Info("Initialization complete. Starting services.")
+	// Start services
+	for _, svc := range services {
+		svc := svc
+		log := b.log.WithField("service", svc.String())
+
+		if b.cfg.Oneshot {
+			svc, ok := svc.(OneShotService)
+			// We ignore services with no one-shot implementation
+			if !ok {
+				log.Debug("Service does not support oneshot mode, ignoring.")
+				continue
+			}
+			eg.Go(func() error {
+				log.Info("Running service in oneshot mode.")
+				err := svc.OneShot(egCtx)
+				if err != nil {
+					log.WithError(err).Error("Service exited with error.")
+					return trace.Wrap(err, "service(%s)", svc.String())
+				}
+				log.Info("Service finished.")
+				return nil
+			})
+		} else {
+			eg.Go(func() error {
+				log.Info("Starting service.")
+				err := svc.Run(egCtx)
+				if err != nil {
+					log.WithError(err).Error("Service exited with error.")
+					return trace.Wrap(err, "service(%s)", svc.String())
+				}
+				log.Info("Service exited.")
+				return nil
+			})
+		}
+	}
 
 	return eg.Wait()
 }
 
-// initialize returns an unlock function which must be deferred.
-func (b *Bot) initialize(ctx context.Context) (func() error, error) {
-	if b.cfg.AuthServer == "" {
+// preRunChecks returns an unlock function which must be deferred.
+// It performs any initial validation and locks the bot's storage before any
+// more expensive initialization is performed.
+func (b *Bot) preRunChecks(ctx context.Context) (func() error, error) {
+	ctx, span := tracer.Start(ctx, "Bot/preRunChecks")
+	defer span.End()
+
+	switch _, addrKind := b.cfg.Address(); addrKind {
+	case config.AddressKindUnspecified:
 		return nil, trace.BadParameter(
-			"an auth or proxy server must be set via --auth-server or configuration",
+			"either a proxy or auth address must be set using --proxy, --auth-server or configuration",
 		)
+	case config.AddressKindAuth:
+		// TODO(noah): DELETE IN V17.0.0
+		b.log.Warn("We recently introduced the ability to explicitly configure the address of the Teleport Proxy using --proxy-server. We recommend switching to this if you currently provide the address of the Proxy to --auth-server.")
+	}
+
+	// Ensure they have provided a join method.
+	if b.cfg.Onboarding.JoinMethod == types.JoinMethodUnspecified {
+		return nil, trace.BadParameter("join method must be provided")
 	}
 
 	if b.cfg.FIPS {
@@ -278,169 +351,51 @@ func (b *Bot) initialize(ctx context.Context) (func() error, error) {
 	}
 
 	// First, try to make sure all destinations are usable.
-	if err := checkDestinations(b.cfg); err != nil {
+	if err := checkDestinations(ctx, b.cfg); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
-	// Start by loading the bot's primary destination.
-	dest, err := b.cfg.Storage.GetDestination()
-	if err != nil {
+	// Start by loading the bot's primary storage.
+	store := b.cfg.Storage.Destination
+	if err := identity.VerifyWrite(ctx, store); err != nil {
 		return nil, trace.Wrap(
-			err, "could not read bot storage destination from config",
+			err, "Could not write to destination %s, aborting", store,
 		)
 	}
 
 	// Now attempt to lock the destination so we have sole use of it
-	unlock, err := dest.TryLock()
+	unlock, err := store.TryLock()
 	if err != nil {
 		if errors.Is(err, utils.ErrUnsuccessfulLockTry) {
-			return unlock, trace.WrapWithMessage(err, "Failed to acquire exclusive lock for tbot destination directory - is tbot already running?")
+			return unlock, trace.Wrap(
+				err,
+				"Failed to acquire exclusive lock for tbot destination directory - is tbot already running?",
+			)
 		}
 		return unlock, trace.Wrap(err)
 	}
 
-	var authClient auth.ClientI
-
-	fetchNewIdentity := true
-	// First, attempt to load an identity from storage.
-	ident, err := identity.LoadIdentity(dest, identity.BotKinds()...)
-	if err == nil {
-		if b.cfg.Onboarding != nil && b.cfg.Onboarding.HasToken() {
-			// try to grab the token to see if it's changed, as we'll need to fetch a new identity if it has
-			if token, err := b.cfg.Onboarding.Token(); err == nil {
-				sha := sha256.Sum256([]byte(token))
-				configTokenHashBytes := []byte(hex.EncodeToString(sha[:]))
-
-				fetchNewIdentity = hasTokenChanged(ident.TokenHashBytes, configTokenHashBytes)
-			} else {
-				// we failed to get the token, we'll continue on trying to use the existing identity
-				b.log.WithError(err).Error("There was an error loading the token")
-
-				fetchNewIdentity = false
-
-				b.log.Info("Using the last good identity")
-			}
-		}
-
-		if !fetchNewIdentity {
-			identStr, err := describeTLSIdentity(ident)
-			if err != nil {
-				return unlock, trace.Wrap(err)
-			}
-
-			b.log.Infof("Successfully loaded bot identity, %s", identStr)
-
-			if err := b.checkIdentity(ident); err != nil {
-				return unlock, trace.Wrap(err)
-			}
-
-			if b.cfg.Onboarding != nil {
-				b.log.Warn("Note: onboarding config ignored as identity was loaded from persistent storage")
-			}
-
-			authClient, err = b.AuthenticatedUserClientFromIdentity(ctx, ident)
-			if err != nil {
-				return unlock, trace.Wrap(err)
-			}
-		}
-	}
-
-	if fetchNewIdentity {
-		if ident != nil {
-			// If ident is set here, we detected a token change above.
-			b.log.Warnf("Detected a token change, will attempt to fetch a new identity.")
-		} else if trace.IsNotFound(err) {
-			// This is _probably_ a fresh start, so we'll log the true error
-			// and try to fetch a fresh identity.
-			b.log.Debugf("Identity %s is not found or empty and could not be loaded, will start from scratch: %+v", dest, err)
-		} else {
-			return unlock, trace.Wrap(err)
-		}
-
-		// Verify we can write to the destination.
-		if err := identity.VerifyWrite(dest); err != nil {
-			return unlock, trace.Wrap(
-				err, "Could not write to destination %s, aborting.", dest,
-			)
-		}
-
-		// Get first identity
-		ident, err = b.getIdentityFromToken()
-		if err != nil {
-			return unlock, trace.Wrap(err)
-		}
-
-		b.log.Debug("Attempting first connection using initial auth client")
-		authClient, err = b.AuthenticatedUserClientFromIdentity(ctx, ident)
-		if err != nil {
-			return unlock, trace.Wrap(err)
-		}
-
-		// Attempt a request to make sure our client works.
-		if _, err := authClient.Ping(ctx); err != nil {
-			return unlock, trace.Wrap(err, "unable to communicate with auth server")
-		}
-
-		identStr, err := describeTLSIdentity(ident)
-		if err != nil {
-			return unlock, trace.Wrap(err)
-		}
-		b.log.Infof("Successfully generated new bot identity, %s", identStr)
-
-		b.log.Debugf("Storing new bot identity to %s", dest)
-		if err := identity.SaveIdentity(ident, dest, identity.BotKinds()...); err != nil {
-			return unlock, trace.Wrap(
-				err, "unable to save generated identity back to destination",
-			)
-		}
-	}
-
-	b.setClient(authClient)
-	b.setIdent(ident)
-
 	return unlock, nil
-}
-
-func hasTokenChanged(configTokenBytes, identityBytes []byte) bool {
-	if len(configTokenBytes) == 0 || len(identityBytes) == 0 {
-		return false
-	}
-
-	return !bytes.Equal(identityBytes, configTokenBytes)
 }
 
 // checkDestinations checks all destinations and tries to create any that
 // don't already exist.
-func checkDestinations(cfg *config.BotConfig) error {
+func checkDestinations(ctx context.Context, cfg *config.BotConfig) error {
 	// Note: This is vaguely problematic as we don't recommend that users
 	// store renewable certs under the same user as end-user certs. That said,
 	//  - if the destination was properly created via tbot init this is a no-op
 	//  - if users intend to follow that advice but miss a step, it should fail
 	//    due to lack of permissions
-	storage, err := cfg.Storage.GetDestination()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	// TODO: consider warning if ownership of all destintions is not expected.
+	storageDest := cfg.Storage.Destination
 
 	// Note: no subdirs to init for bot's internal storage.
-	if err := storage.Init([]string{}); err != nil {
+	if err := storageDest.Init(ctx, []string{}); err != nil {
 		return trace.Wrap(err)
 	}
 
-	for _, dest := range cfg.Destinations {
-		destImpl, err := dest.GetDestination()
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		subdirs, err := dest.ListSubdirectories()
-		if err != nil {
-			return trace.Wrap(err)
-		}
-
-		if err := destImpl.Init(subdirs); err != nil {
+	// TODO: consider warning if ownership of all destinations is not expected.
+	for _, output := range cfg.Outputs {
+		if err := output.Init(ctx); err != nil {
 			return trace.Wrap(err)
 		}
 	}
@@ -450,7 +405,7 @@ func checkDestinations(cfg *config.BotConfig) error {
 
 // checkIdentity performs basic startup checks on an identity and loudly warns
 // end users if it is unlikely to work.
-func (b *Bot) checkIdentity(ident *identity.Identity) error {
+func checkIdentity(log logrus.FieldLogger, ident *identity.Identity) error {
 	var validAfter time.Time
 	var validBefore time.Time
 
@@ -466,13 +421,13 @@ func (b *Bot) checkIdentity(ident *identity.Identity) error {
 
 	now := time.Now().UTC()
 	if now.After(validBefore) {
-		b.log.Errorf(
+		log.Errorf(
 			"Identity has expired. The renewal is likely to fail. (expires: %s, current time: %s)",
 			validBefore.Format(time.RFC3339),
 			now.Format(time.RFC3339),
 		)
 	} else if now.Before(validAfter) {
-		b.log.Warnf(
+		log.Warnf(
 			"Identity is not yet valid. Confirm that the system time is correct. (valid after: %s, current time: %s)",
 			validAfter.Format(time.RFC3339),
 			now.Format(time.RFC3339),
@@ -480,4 +435,123 @@ func (b *Bot) checkIdentity(ident *identity.Identity) error {
 	}
 
 	return nil
+}
+
+// clientForFacade creates a new auth client from the given
+// facade. Note that depending on the connection address given, this may
+// attempt to connect via the proxy and therefore requires both SSH and TLS
+// credentials.
+func clientForFacade(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	cfg *config.BotConfig,
+	facade *identity.Facade,
+	resolver reversetunnelclient.Resolver) (*auth.Client, error) {
+	ctx, span := tracer.Start(ctx, "clientForFacade")
+	defer span.End()
+
+	tlsConfig, err := facade.TLSConfig()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	sshConfig, err := facade.SSHClientConfig()
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	addr, _ := cfg.Address()
+	parsedAddr, err := utils.ParseAddr(addr)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	authClientConfig := &authclient.Config{
+		TLS: tlsConfig,
+		SSH: sshConfig,
+		// TODO(noah): It'd be ideal to distinguish the proxy addr and auth addr
+		// here to avoid pointlessly hitting the address as an auth server.
+		AuthServers: []utils.NetAddr{*parsedAddr},
+		Log:         log,
+		Insecure:    cfg.Insecure,
+		Resolver:    resolver,
+		DialOpts:    []grpc.DialOption{metadata.WithUserAgentFromTeleportComponent(teleport.ComponentTBot)},
+	}
+
+	c, err := authclient.Connect(ctx, authClientConfig)
+	return c, trace.Wrap(err)
+}
+
+type authPingCache struct {
+	client *auth.Client
+	log    logrus.FieldLogger
+
+	mu          sync.RWMutex
+	cachedValue *proto.PingResponse
+}
+
+func (a *authPingCache) ping(ctx context.Context) (proto.PingResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cachedValue != nil {
+		return *a.cachedValue, nil
+	}
+
+	a.log.Debug("Pinging auth server.")
+	res, err := a.client.Ping(ctx)
+	if err != nil {
+		a.log.WithError(err).Error("Failed to ping auth server.")
+		return proto.PingResponse{}, trace.Wrap(err)
+	}
+	a.cachedValue = &res
+	a.log.WithField("pong", res).Debug("Successfully pinged auth server.")
+
+	return *a.cachedValue, nil
+}
+
+type proxyPingCache struct {
+	authPingCache *authPingCache
+	botCfg        *config.BotConfig
+	log           logrus.FieldLogger
+
+	mu          sync.RWMutex
+	cachedValue *webclient.PingResponse
+}
+
+func (p *proxyPingCache) ping(ctx context.Context) (*webclient.PingResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cachedValue != nil {
+		return p.cachedValue, nil
+	}
+
+	// Determine the Proxy address to use.
+	addr, addrKind := p.botCfg.Address()
+	switch addrKind {
+	case config.AddressKindAuth:
+		// If the address is an auth address, ping auth to determine proxy addr.
+		authPong, err := p.authPingCache.ping(ctx)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		addr = authPong.ProxyPublicAddr
+	case config.AddressKindProxy:
+		// If the address is a proxy address, use it directly.
+	default:
+		return nil, trace.BadParameter("unsupported address kind: %v", addrKind)
+	}
+
+	p.log.WithField("addr", addr).Debug("Pinging proxy.")
+	res, err := webclient.Find(&webclient.Config{
+		Context:   ctx,
+		ProxyAddr: addr,
+		Insecure:  p.botCfg.Insecure,
+	})
+	if err != nil {
+		p.log.WithError(err).Error("Failed to ping proxy.")
+		return nil, trace.Wrap(err)
+	}
+	p.log.WithField("pong", res).Debug("Successfully pinged proxy.")
+	p.cachedValue = res
+
+	return p.cachedValue, nil
 }

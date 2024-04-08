@@ -17,11 +17,12 @@ limitations under the License.
 package events
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"reflect"
 
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 )
 
 // MustToOneOf converts audit event to OneOf
@@ -46,6 +47,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *UserCreate:
 		out.Event = &OneOf_UserCreate{
 			UserCreate: e,
+		}
+	case *UserUpdate:
+		out.Event = &OneOf_UserUpdate{
+			UserUpdate: e,
 		}
 	case *UserDelete:
 		out.Event = &OneOf_UserDelete{
@@ -139,6 +144,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_RoleCreate{
 			RoleCreate: e,
 		}
+	case *RoleUpdate:
+		out.Event = &OneOf_RoleUpdate{
+			RoleUpdate: e,
+		}
 	case *RoleDelete:
 		out.Event = &OneOf_RoleDelete{
 			RoleDelete: e,
@@ -159,9 +168,17 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_TrustedClusterTokenCreate{
 			TrustedClusterTokenCreate: e,
 		}
+	case *ProvisionTokenCreate:
+		out.Event = &OneOf_ProvisionTokenCreate{
+			ProvisionTokenCreate: e,
+		}
 	case *GithubConnectorCreate:
 		out.Event = &OneOf_GithubConnectorCreate{
 			GithubConnectorCreate: e,
+		}
+	case *GithubConnectorUpdate:
+		out.Event = &OneOf_GithubConnectorUpdate{
+			GithubConnectorUpdate: e,
 		}
 	case *GithubConnectorDelete:
 		out.Event = &OneOf_GithubConnectorDelete{
@@ -171,6 +188,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_OIDCConnectorCreate{
 			OIDCConnectorCreate: e,
 		}
+	case *OIDCConnectorUpdate:
+		out.Event = &OneOf_OIDCConnectorUpdate{
+			OIDCConnectorUpdate: e,
+		}
 	case *OIDCConnectorDelete:
 		out.Event = &OneOf_OIDCConnectorDelete{
 			OIDCConnectorDelete: e,
@@ -178,6 +199,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *SAMLConnectorCreate:
 		out.Event = &OneOf_SAMLConnectorCreate{
 			SAMLConnectorCreate: e,
+		}
+	case *SAMLConnectorUpdate:
+		out.Event = &OneOf_SAMLConnectorUpdate{
+			SAMLConnectorUpdate: e,
 		}
 	case *SAMLConnectorDelete:
 		out.Event = &OneOf_SAMLConnectorDelete{
@@ -242,6 +267,10 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 	case *DatabaseSessionQuery:
 		out.Event = &OneOf_DatabaseSessionQuery{
 			DatabaseSessionQuery: e,
+		}
+	case *DatabasePermissionUpdate:
+		out.Event = &OneOf_DatabasePermissionUpdate{
+			DatabasePermissionUpdate: e,
 		}
 	case *PostgresParse:
 		out.Event = &OneOf_PostgresParse{
@@ -491,6 +520,18 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_InstanceJoin{
 			InstanceJoin: e,
 		}
+	case *BotCreate:
+		out.Event = &OneOf_BotCreate{
+			BotCreate: e,
+		}
+	case *BotUpdate:
+		out.Event = &OneOf_BotUpdate{
+			BotUpdate: e,
+		}
+	case *BotDelete:
+		out.Event = &OneOf_BotDelete{
+			BotDelete: e,
+		}
 	case *LoginRuleCreate:
 		out.Event = &OneOf_LoginRuleCreate{
 			LoginRuleCreate: e,
@@ -519,8 +560,109 @@ func ToOneOf(in AuditEvent) (*OneOf, error) {
 		out.Event = &OneOf_SAMLIdPServiceProviderDeleteAll{
 			SAMLIdPServiceProviderDeleteAll: e,
 		}
+	case *OktaResourcesUpdate:
+		out.Event = &OneOf_OktaResourcesUpdate{
+			OktaResourcesUpdate: e,
+		}
+	case *OktaSyncFailure:
+		out.Event = &OneOf_OktaSyncFailure{
+			OktaSyncFailure: e,
+		}
+	case *OktaAssignmentResult:
+		out.Event = &OneOf_OktaAssignmentResult{
+			OktaAssignmentResult: e,
+		}
+	case *AccessListCreate:
+		out.Event = &OneOf_AccessListCreate{
+			AccessListCreate: e,
+		}
+	case *AccessListUpdate:
+		out.Event = &OneOf_AccessListUpdate{
+			AccessListUpdate: e,
+		}
+	case *AccessListDelete:
+		out.Event = &OneOf_AccessListDelete{
+			AccessListDelete: e,
+		}
+	case *AccessListReview:
+		out.Event = &OneOf_AccessListReview{
+			AccessListReview: e,
+		}
+	case *AccessListMemberCreate:
+		out.Event = &OneOf_AccessListMemberCreate{
+			AccessListMemberCreate: e,
+		}
+	case *AccessListMemberUpdate:
+		out.Event = &OneOf_AccessListMemberUpdate{
+			AccessListMemberUpdate: e,
+		}
+	case *AccessListMemberDelete:
+		out.Event = &OneOf_AccessListMemberDelete{
+			AccessListMemberDelete: e,
+		}
+	case *AccessListMemberDeleteAllForAccessList:
+		out.Event = &OneOf_AccessListMemberDeleteAllForAccessList{
+			AccessListMemberDeleteAllForAccessList: e,
+		}
+	case *AuditQueryRun:
+		out.Event = &OneOf_AuditQueryRun{
+			AuditQueryRun: e,
+		}
+	case *SecurityReportRun:
+		out.Event = &OneOf_SecurityReportRun{
+			SecurityReportRun: e,
+		}
+	case *ExternalAuditStorageEnable:
+		out.Event = &OneOf_ExternalAuditStorageEnable{
+			ExternalAuditStorageEnable: e,
+		}
+	case *ExternalAuditStorageDisable:
+		out.Event = &OneOf_ExternalAuditStorageDisable{
+			ExternalAuditStorageDisable: e,
+		}
+	case *CreateMFAAuthChallenge:
+		out.Event = &OneOf_CreateMFAAuthChallenge{
+			CreateMFAAuthChallenge: e,
+		}
+	case *ValidateMFAAuthResponse:
+		out.Event = &OneOf_ValidateMFAAuthResponse{
+			ValidateMFAAuthResponse: e,
+		}
+	case *OktaAccessListSync:
+		out.Event = &OneOf_OktaAccessListSync{
+			OktaAccessListSync: e,
+		}
+	case *OktaUserSync:
+		out.Event = &OneOf_OktaUserSync{
+			OktaUserSync: e,
+		}
+	case *SPIFFESVIDIssued:
+		out.Event = &OneOf_SPIFFESVIDIssued{
+			SPIFFESVIDIssued: e,
+		}
+	case *AuthPreferenceUpdate:
+		out.Event = &OneOf_AuthPreferenceUpdate{
+			AuthPreferenceUpdate: e,
+		}
+	case *ClusterNetworkingConfigUpdate:
+		out.Event = &OneOf_ClusterNetworkingConfigUpdate{
+			ClusterNetworkingConfigUpdate: e,
+		}
+	case *SessionRecordingConfigUpdate:
+		out.Event = &OneOf_SessionRecordingConfigUpdate{
+			SessionRecordingConfigUpdate: e,
+		}
+	case *DatabaseUserCreate:
+		out.Event = &OneOf_DatabaseUserCreate{
+			DatabaseUserCreate: e,
+		}
+	case *DatabaseUserDeactivate:
+		out.Event = &OneOf_DatabaseUserDeactivate{
+			DatabaseUserDeactivate: e,
+		}
+
 	default:
-		log.Errorf("Attempted to convert dynamic event of unknown type \"%v\" into protobuf event.", in.GetType())
+		slog.ErrorContext(context.Background(), "Attempted to convert dynamic event of unknown type into protobuf event.", "event_type", in.GetType())
 		unknown := &Unknown{}
 		unknown.Type = UnknownEvent
 		unknown.Code = UnknownCode

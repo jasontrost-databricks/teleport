@@ -1,23 +1,26 @@
 /*
-Copyright 2023 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-	http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package web
 
 import (
 	"net/http"
+	"net/url"
 
 	"github.com/gravitational/trace"
 	"github.com/julienschmidt/httprouter"
@@ -25,12 +28,12 @@ import (
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/httplib"
-	"github.com/gravitational/teleport/lib/reversetunnel"
+	"github.com/gravitational/teleport/lib/reversetunnelclient"
 	"github.com/gravitational/teleport/lib/web/ui"
 )
 
 // integrationsCreate creates an Integration
-func (h *Handler) integrationsCreate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+func (h *Handler) integrationsCreate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	var req *ui.Integration
 	if err := httplib.ReadJSON(r, &req); err != nil {
 		return nil, trace.Wrap(err)
@@ -45,10 +48,20 @@ func (h *Handler) integrationsCreate(w http.ResponseWriter, r *http.Request, p h
 
 	switch req.SubKind {
 	case types.IntegrationSubKindAWSOIDC:
+		var s3Location string
+		if req.AWSOIDC.IssuerS3Bucket != "" {
+			issuerS3URI := url.URL{
+				Scheme: "s3",
+				Host:   req.AWSOIDC.IssuerS3Bucket,
+				Path:   req.AWSOIDC.IssuerS3Prefix,
+			}
+			s3Location = issuerS3URI.String()
+		}
 		ig, err = types.NewIntegrationAWSOIDC(
 			types.Metadata{Name: req.Name},
 			&types.AWSOIDCIntegrationSpecV1{
-				RoleARN: req.AWSOIDC.RoleARN,
+				RoleARN:     req.AWSOIDC.RoleARN,
+				IssuerS3URI: s3Location,
 			},
 		)
 
@@ -73,11 +86,16 @@ func (h *Handler) integrationsCreate(w http.ResponseWriter, r *http.Request, p h
 		return nil, trace.Wrap(err)
 	}
 
-	return ui.MakeIntegration(storedIntegration), nil
+	uiIg, err := ui.MakeIntegration(storedIntegration)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	return uiIg, nil
 }
 
 // integrationsUpdate updates the Integration based on its name
-func (h *Handler) integrationsUpdate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+func (h *Handler) integrationsUpdate(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	integrationName := p.ByName("name")
 	if integrationName == "" {
 		return nil, trace.BadParameter("an integration name is required")
@@ -107,6 +125,16 @@ func (h *Handler) integrationsUpdate(w http.ResponseWriter, r *http.Request, p h
 			return nil, trace.BadParameter("cannot update %q fields for a %q integration", types.IntegrationSubKindAWSOIDC, integration.GetSubKind())
 		}
 
+		var s3Location string
+		if req.AWSOIDC.IssuerS3Bucket != "" {
+			issuerS3URI := url.URL{
+				Scheme: "s3",
+				Host:   req.AWSOIDC.IssuerS3Bucket,
+				Path:   req.AWSOIDC.IssuerS3Prefix,
+			}
+			s3Location = issuerS3URI.String()
+		}
+		integration.SetAWSOIDCIssuerS3URI(s3Location)
 		integration.SetAWSOIDCRoleARN(req.AWSOIDC.RoleARN)
 	}
 
@@ -114,11 +142,16 @@ func (h *Handler) integrationsUpdate(w http.ResponseWriter, r *http.Request, p h
 		return nil, trace.Wrap(err)
 	}
 
-	return ui.MakeIntegration(integration), nil
+	uiIg, err := ui.MakeIntegration(integration)
+	if err != nil {
+		return nil, err
+	}
+
+	return uiIg, nil
 }
 
 // integrationsDelete removes an Integration based on its name
-func (h *Handler) integrationsDelete(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+func (h *Handler) integrationsDelete(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	integrationName := p.ByName("name")
 	if integrationName == "" {
 		return nil, trace.BadParameter("an integration name is required")
@@ -137,7 +170,7 @@ func (h *Handler) integrationsDelete(w http.ResponseWriter, r *http.Request, p h
 }
 
 // integrationsGet returns an Integration based on its name
-func (h *Handler) integrationsGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+func (h *Handler) integrationsGet(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	integrationName := p.ByName("name")
 	if integrationName == "" {
 		return nil, trace.BadParameter("an integration name is required")
@@ -153,18 +186,23 @@ func (h *Handler) integrationsGet(w http.ResponseWriter, r *http.Request, p http
 		return nil, trace.Wrap(err)
 	}
 
-	return ui.MakeIntegration(ig), nil
+	uiIg, err := ui.MakeIntegration(ig)
+	if err != nil {
+		return nil, err
+	}
+
+	return uiIg, nil
 }
 
 // integrationsList returns a page of Integrations
-func (h *Handler) integrationsList(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnel.RemoteSite) (interface{}, error) {
+func (h *Handler) integrationsList(w http.ResponseWriter, r *http.Request, p httprouter.Params, sctx *SessionContext, site reversetunnelclient.RemoteSite) (interface{}, error) {
 	clt, err := sctx.GetUserClient(r.Context(), site)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 
 	values := r.URL.Query()
-	limit, err := queryLimitAsInt32(values, "limit", defaults.MaxIterationLimit)
+	limit, err := QueryLimitAsInt32(values, "limit", defaults.MaxIterationLimit)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -176,8 +214,13 @@ func (h *Handler) integrationsList(w http.ResponseWriter, r *http.Request, p htt
 		return nil, trace.Wrap(err)
 	}
 
+	items, err := ui.MakeIntegrations(igs)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
 	return ui.IntegrationsListResponse{
-		Items:   ui.MakeIntegrations(igs),
+		Items:   items,
 		NextKey: nextKey,
 	}, nil
 }

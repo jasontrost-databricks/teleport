@@ -18,11 +18,11 @@ package types
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 )
 
 // TrustedCluster holds information needed for a cluster that can not be directly
@@ -130,6 +130,16 @@ func (c *TrustedClusterV2) GetResourceID() int64 {
 // SetResourceID sets resource ID
 func (c *TrustedClusterV2) SetResourceID(id int64) {
 	c.Metadata.ID = id
+}
+
+// GetRevision returns the revision
+func (c *TrustedClusterV2) GetRevision() string {
+	return c.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (c *TrustedClusterV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // CombinedMapping is used to specify combined mapping from legacy property Roles

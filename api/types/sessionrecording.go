@@ -17,11 +17,11 @@ limitations under the License.
 package types
 
 import (
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/gravitational/trace"
-	"golang.org/x/exp/slices"
 )
 
 // SessionRecordingConfig defines session recording configuration. This is
@@ -111,6 +111,16 @@ func (c *SessionRecordingConfigV2) GetResourceID() int64 {
 // SetResourceID sets resource ID.
 func (c *SessionRecordingConfigV2) SetResourceID(id int64) {
 	c.Metadata.ID = id
+}
+
+// GetRevision returns the revision
+func (c *SessionRecordingConfigV2) GetRevision() string {
+	return c.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (c *SessionRecordingConfigV2) SetRevision(rev string) {
+	c.Metadata.SetRevision(rev)
 }
 
 // Origin returns the origin value of the resource.

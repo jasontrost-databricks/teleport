@@ -1,139 +1,214 @@
 ---
-title: Connect a Kubernetes Cluster to Teleport
-description: Connecting a Kubernetes cluster to Teleport
+title: Enroll a Kubernetes Cluster
+description: Demonstrates how to enroll a Kubernetes cluster as a resource protected by Teleport.
 videoBanner: 3AUGrOZ5me0
 ---
 
-In this guide, we will show you how to register a Kubernetes cluster with
-Teleport by deploying the Teleport Kubernetes Service on the Kubernetes cluster
-you want to register.
+This guide demonstrates how to enroll a Kubernetes cluster as a Teleport
+resource by deploying the Teleport Kubernetes Service on the Kubernetes cluster
+you want to protect. 
 
-In this setup, the Teleport Kubernetes Service pod detects that it is running on
-Kubernetes and registers the cluster automatically.
+In this scenario, the Teleport Kubernetes Service pod detects that it is running
+on Kubernetes and enrolls the Kubernetes cluster automatically. The following
+diagram provides a simplified overview of this deployment scenario with the
+Teleport Kubernetes Service running on the Kubernetes cluster:
 
-<Notice type="tip">
+![Enroll a Kubernetes cluster](../../img/k8s/enroll-kubernetes.png)
 
-You can also run the Teleport Kubernetes Service on a Linux host in a separate
-network from your Kubernetes cluster. Learn how in [Kubernetes Access from a
-Standalone Teleport Cluster](./register-clusters/static-kubeconfig.mdx).
-
-</Notice>
+For information about other ways to enroll and discover Kubernetes clusters, see
+[Registering Kubernetes Clusters with Teleport](./register-clusters.mdx).
 
 ## Prerequisites
 
-(!docs/pages/includes/edition-prereqs-tabs.mdx!)
+- Access to a running Teleport cluster, `tctl` admin tool, and `tsh` client tool, 
+  version >= (=teleport.version=). 
+  
+  For Teleport Enterprise and Teleport Enterprise Cloud, you should
+  use the Enterprise version of `tctl`. 
+  You can verify the tools you have installed by running the following commands:
+
+  ```code
+  $ tctl version
+  # Teleport Enterprise v(=teleport.version=) go(=teleport.golang=)
+  
+  $ tsh version
+  # Teleport v(=teleport.version=) go(=teleport.golang=)
+  ```
+
+  You can download these tools by following the appropriate [Installation 
+  instructions](../installation.mdx#linux) for your environment.
 
 (!docs/pages/includes/kubernetes-access/helm-k8s.mdx!)
 
 - (!docs/pages/includes/tctl.mdx!)
 
-## Deployment overview
+## Step 1/3. Create RBAC resources
 
-In this guide, we deploy the Teleport Kubernetes Service, which connects
-Kubernetes cluster `cookie` to Teleport cluster `tele.example.com`:
+To authenticate to a Kubernetes cluster using Teleport, you must have a Teleport
+role that grants access to the Kubernetes cluster you plan to interact with.
 
-<Notice type="tip" scope={["cloud"]}>
+In this step, we show you how to create a Teleport role called `kube-access`
+that enables a user to send requests to any Teleport-protected Kubernetes
+cluster as a member of the `viewers` group. The Teleport Kubernetes Service
+impersonates the `viewers` group when proxying requests from the user.
 
-In your Teleport Cloud account, the name of your cluster will be your tenant
-domain name, e.g., `mytenant.teleport.sh`, rather than `teleport.example.com`.
+1. Create a file called `kube-access.yaml` with the following content:
+   
+   ```yaml
+   kind: role
+   metadata:
+     name: kube-access
+   version: v7
+   spec:
+     allow:
+       kubernetes_labels:
+         '*': '*'
+       kubernetes_resources:
+         - kind: '*'
+           namespace: '*'
+           name: '*'
+           verbs: ['*']
+       kubernetes_groups:
+       - viewers
+     deny: {}
+   ```
 
-</Notice>
+1. Apply your changes:
 
-<Figure align="left" bordered caption="Kubernetes Service dialing back to the Teleport cluster">
-  ![Kubernetes agent](../../img/k8s/agent.svg)
-</Figure>
+   ```code
+   $ tctl create -f kube-access.yaml
+   ```
 
-## Step 1/3. Get a join token
+1. (!docs/pages/includes/add-role-to-user.mdx role="kube-access"!)
 
-In order to start the Teleport Kubernetes Service, we will need to request a
-join token from the Teleport Auth Service:
+While you have authorized the `kube-access` role to access Kubernetes clusters
+as a member of the `viewers` group, this group does not yet have permissions
+within its Kubernetes cluster. To assign these permissions, create a Kubernetes
+`RoleBinding` or `ClusterRoleBindings` that grants permission to the `viewers`
+group.
+   
+1. Create a file called `viewers-bind.yaml` with the following contents:
 
-```code
-# Create a join token for the Teleport Kubernetes Service to authenticate
-$ TOKEN=$(tctl tokens add --type=kube --ttl=1h --format=text)
-$ echo $TOKEN
-```
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: ClusterRoleBinding
+   metadata:
+     name: viewers-crb
+   subjects:
+   - kind: Group
+     # Bind the group "viewers" to the kubernetes_groups assigned in the "kube-access" role
+     name: viewers
+     apiGroup: rbac.authorization.k8s.io
+   roleRef:
+     kind: ClusterRole
+     # "view" is a default ClusterRole that grants read-only access to resources
+     # See: https://kubernetes.io/docs/reference/access-authn-authz/rbac/#user-facing-roles
+     name: view
+     apiGroup: rbac.authorization.k8s.io
+   ```
 
-## Step 2/3. Deploy teleport-kube-agent
+1. Apply the `ClusterRoleBinding` with `kubectl`:
+   
+   ```code
+   $ kubectl apply -f viewers-bind.yaml
+   ```
 
-<Notice type="tip" >
+Your Teleport user now has permissions to assume membership in the `viewers`
+group when accessing your Kubernetes cluster, and the `viewers` group now has
+permissions to view resources in the cluster. The next step is to deploy the
+Teleport Kubernetes Service in the cluster to proxy user requests.
 
-The Teleport Kubernetes Service version should be the same as the Teleport Cluster version
-or up to one major version back. You can set the version override with the override variable, ex: `--set teleportVersionOverride=(=teleport.version=)`.
+## Step 2/3. Follow guided enrollment instructions
 
-</Notice>
+In this step, you will deploy the Teleport Kubernetes Service on your Kubernetes
+cluster by copying a script from the Teleport Web UI and running it on your
+terminal.
 
-(!docs/pages/kubernetes-access/helm/includes/helm-repo-add.mdx!)
+1. Open the Teleport Web UI and sign in using your administrative account.
 
-<Tabs>
-<TabItem scope={["oss", "enterprise"]} label="Self-Hosted">
+1. Click **Enroll New Resource**.
 
-Switch `kubectl` to the Kubernetes cluster `cookie` and run the following
-commands, assigning `PROXY_ADDR` to the address of your Auth Service or Proxy
-Service.
+1. Type all or part of **Kubernetes** in the Search field to filter the resource types 
+   displayed, then click **Kubernetes**.
 
-```code
-$ PROXY_ADDR=tele.example.com:443
+1. Copy the command to add the `teleport-agent` chart repository and paste 
+   it in a terminal on your workstation.
 
-# Install Kubernetes agent. It dials back to the Teleport cluster at $PROXY_ADDR
-$ CLUSTER=cookie
-$ helm install teleport-agent teleport/teleport-kube-agent \
-  --set kubeClusterName=${CLUSTER?} \
-  --set proxyAddr=${PROXY_ADDR?} \
-  --set authToken=${TOKEN?} \
-  --create-namespace \
-  --namespace=teleport-agent \
-  --version (=teleport.version=)
-```
+1. Type `teleport-agent` for namespace where you will deploy the Teleport
+   Kubernetes Service and the display name to use when connecting to this
+   cluster, then click **Next**.
 
-</TabItem>
-<TabItem scope={["cloud"]} label="Teleport Cloud">
+   After you click Next, Teleport generates a script to configure and enroll the 
+   Kubernetes cluster as a resource in the Teleport cluster.
 
-Switch `kubectl` to the Kubernetes cluster `cookie` and run the following
-commands, assigning `PROXY_ADDR` to the address of your Teleport Cloud tenant.
+1. Copy the command displayed in the Teleport Web UI and run it in your
+   terminal.
 
-```code
-$ PROXY_ADDR=mytenant.teleport.sh:443
+   The Teleport Web UI displays "Successfully detected your new Kubernetes cluster" as 
+   confirmation that your cluster is enrolled. When you see this message, click **Next**
+   to continue.
 
-# Install Kubernetes agent. It dials back to the Teleport cluster at $PROXY_ADDR
-$ CLUSTER=cookie
-# Run the helm install specifying to match to the Teleport Cloud version of Teleport
-$ helm install teleport-agent teleport/teleport-kube-agent \
-  --set kubeClusterName=${CLUSTER?} \
-  --set proxyAddr=${PROXY_ADDR?} \
-  --set authToken=${TOKEN?} \
-  --create-namespace \
-  --namespace=teleport-agent \
-  --version (=cloud.version=)
-```
+## Step 3/3. Test Kubernetes access
 
-</TabItem>
-</Tabs>
+Now that you have deployed the Teleport Kubernetes Service on your Kubernetes
+cluster and enrolled the cluster as a Teleport resource, confirm that you can
+access your Kubernetes cluster as a member of the `viewers` group.
 
-## Step 3/3 Access your Kubernetes cluster
+If you followed the previous steps in this guide, the **Set Up Access** view
+populates the **Kubernetes Groups** field with `viewers`.
 
-(!docs/pages/includes/kubernetes-access/rbac.mdx!)
+To set up and test access:
 
-### View pods in your cluster
+1. Click **Next**.
 
-List connected clusters using `tsh kube ls` and switch between
-them using `tsh kube login`:
+1. Specify the `teleport-agent` namespace, the Kubernetes `viewers` group from
+   the previous step, and your Teleport user name.
 
-```code
-$ tsh kube ls
+1. Copy and run the commands displayed in the Teleport Web UI to interact with the
+   Kubernetes cluster and verify access through Teleport. Alternatively, run the
+   commands shown below:
 
-# Kube Cluster Name Selected
-# ----------------- --------
-# cookie
+   Authenticate to your Teleport cluster:
 
-# kubeconfig now points to the cookie cluster
-$ tsh kube login cookie
-# Logged into kubernetes cluster "cookie". Try 'kubectl version' to test the connection.
+   ```code
+   $ tsh login --proxy=<Var name="teleport.example.com"/>:443 --auth=local --user=<Var name="admin@example.com"/> <Var name="teleport.example.com"/>
+   ```
 
-# kubectl command executed on `cookie` but is routed through the Teleport cluster.
-$ kubectl get pods
-```
+   List Kubernetes clusters available for you to access:
 
-## Next Steps
+   ```code
+   $ tsh kube ls
+   ```
 
-- Take a look at a [kube-agent helm chart reference](../reference/helm-reference/teleport-kube-agent.mdx) for a full list of parameters.
+   Retrieve credentials to access your Kubernetes cluster:
+
+   ```code
+   $ tsh kube login <Var name="Kubernetes-cluster-name"/>
+   ```
+
+   The Teleport Kubernetes Service proxies `kubectl` commands: 
+
+   ```code
+   $ kubectl get pods -n teleport-agent
+   ```
+
+   You should see the Teleport Kubernetes Service pod you deployed earlier:
+
+   ```text
+   NAME               READY   STATUS    RESTARTS   AGE
+   teleport-agent-0   1/1     Running   0          8m6s
+   ```
+
+1. Click **Finish**.
+
+## Next steps
+
+This guide demonstrated how to enroll a Kubernetes cluster by running the
+Teleport Kubernetes Service within the Kubernetes cluster. 
+
+- For information about discovering Kubernetes clusters hosted on cloud providers, see 
+[Kubernetes Cluster Discovery](../auto-discovery/kubernetes.mdx). 
+- To learn about other ways you can register a Kubernetes cluster with Teleport, see 
+[Registering Kubernetes Clusters with Teleport](./register-clusters.mdx).
+- For a complete list of the parameters you can configure in the `teleport-kube-agent` 
+helm chart, see the [Chart Reference](../reference/helm-reference/teleport-kube-agent.mdx).

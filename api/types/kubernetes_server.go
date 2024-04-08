@@ -47,6 +47,8 @@ type KubeServer interface {
 	String() string
 	// Copy returns a copy of this kube server object.
 	Copy() KubeServer
+	// CloneResource returns a copy of the KubeServer as a ResourceWithLabels
+	CloneResource() ResourceWithLabels
 	// GetCluster returns the Kubernetes Cluster this kube server proxies.
 	GetCluster() KubeCluster
 	// SetCluster sets the kube cluster this kube server server proxies.
@@ -123,6 +125,16 @@ func (s *KubernetesServerV3) SetResourceID(id int64) {
 	s.Metadata.ID = id
 }
 
+// GetRevision returns the revision
+func (s *KubernetesServerV3) GetRevision() string {
+	return s.Metadata.GetRevision()
+}
+
+// SetRevision sets the revision
+func (s *KubernetesServerV3) SetRevision(rev string) {
+	s.Metadata.SetRevision(rev)
+}
+
 // GetMetadata returns the resource metadata.
 func (s *KubernetesServerV3) GetMetadata() Metadata {
 	return s.Metadata
@@ -165,6 +177,9 @@ func (s *KubernetesServerV3) SetRotation(r Rotation) {
 
 // GetCluster returns the cluster this kube server proxies.
 func (s *KubernetesServerV3) GetCluster() KubeCluster {
+	if s.Spec.Cluster == nil {
+		return nil
+	}
 	return s.Spec.Cluster
 }
 
@@ -282,10 +297,23 @@ func (s *KubernetesServerV3) Copy() KubeServer {
 	return utils.CloneProtoMsg(s)
 }
 
+// CloneResource returns a copy of this kube server object.
+func (s *KubernetesServerV3) CloneResource() ResourceWithLabels {
+	return s.Copy()
+}
+
 // MatchSearch goes through select field values and tries to
 // match against the list of search values.
 func (s *KubernetesServerV3) MatchSearch(values []string) bool {
 	return MatchSearch(nil, values, nil)
+}
+
+// IsEqual determines if two kube server resources are equivalent to one another.
+func (k *KubernetesServerV3) IsEqual(i KubeServer) bool {
+	if other, ok := i.(*KubernetesServerV3); ok {
+		return deriveTeleportEqualKubernetesServerV3(k, other)
+	}
+	return false
 }
 
 // KubeServers represents a list of kube servers.
@@ -308,6 +336,15 @@ func (s KubeServers) Less(i, j int) bool {
 
 // Swap swaps two kube servers.
 func (s KubeServers) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
+
+// ToMap returns these kubernetes clusters as a map keyed by cluster name.
+func (s KubeServers) ToMap() map[string]KubeServer {
+	m := make(map[string]KubeServer, len(s))
+	for _, kubeServer := range s {
+		m[kubeServer.GetName()] = kubeServer
+	}
+	return m
+}
 
 // SortByCustom custom sorts by given sort criteria.
 func (s KubeServers) SortByCustom(sortBy SortBy) error {

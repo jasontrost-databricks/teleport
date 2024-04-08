@@ -2,20 +2,22 @@
 // +build linux
 
 /*
-Copyright 2015-2018 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
@@ -29,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gravitational/trace"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,6 +115,23 @@ func TestOSCommandPrep(t *testing.T) {
 	require.Equal(t, expectedEnv, cmd.Env)
 }
 
+func TestConfigureCommand(t *testing.T) {
+	srv := newMockServer(t)
+	scx := newExecServerContext(t, srv)
+
+	unexpectedKey := "FOO"
+	unexpectedValue := "BAR"
+	// environment values in the server context should not be forwarded
+	scx.SetEnv(unexpectedKey, unexpectedValue)
+
+	cmd, err := ConfigureCommand(scx)
+	require.NoError(t, err)
+
+	require.NotNil(t, cmd)
+	require.Equal(t, "/proc/self/exe", cmd.Path)
+	require.NotContains(t, cmd.Env, unexpectedKey+"="+unexpectedValue)
+}
+
 // TestContinue tests if the process hangs if a continue signal is not sent
 // and makes sure the process continues once it has been sent.
 func TestContinue(t *testing.T) {
@@ -134,7 +154,13 @@ func TestContinue(t *testing.T) {
 	// Re-execute Teleport and run "ls". Signal over the context when execution
 	// is complete.
 	go func() {
-		cmdDone <- cmd.Run()
+		if err := cmd.Start(); err != nil {
+			cmdDone <- err
+		}
+
+		// Close the read half of the pipe to unblock the ready signal.
+		closeErr := scx.readyw.Close()
+		cmdDone <- trace.NewAggregate(closeErr, cmd.Wait())
 	}()
 
 	// Wait for the process. Since the continue pipe has not been closed, the
@@ -145,10 +171,11 @@ func TestContinue(t *testing.T) {
 	case <-time.After(5 * time.Second):
 	}
 
-	// Close the continue and terminate pipe to signal to Teleport to now execute the
-	// requested program.
-	err = scx.contw.Close()
-	require.NoError(t, err)
+	// Wait for the child process to indicate its completed initialization.
+	require.NoError(t, scx.execRequest.WaitForChild())
+
+	// Signal to child that it may execute the requested program.
+	scx.execRequest.Continue()
 
 	// Program should have executed now. If the complete signal has not come
 	// over the context, something failed.

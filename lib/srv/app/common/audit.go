@@ -1,18 +1,20 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package common
 
@@ -24,6 +26,7 @@ import (
 	"github.com/gravitational/trace"
 	"github.com/sirupsen/logrus"
 
+	"github.com/gravitational/teleport"
 	apidefaults "github.com/gravitational/teleport/api/defaults"
 	"github.com/gravitational/teleport/api/types"
 	apievents "github.com/gravitational/teleport/api/types/events"
@@ -52,12 +55,17 @@ type Audit interface {
 type AuditConfig struct {
 	// Emitter is used to emit audit events.
 	Emitter apievents.Emitter
+	// Recorder is used to record session events.
+	Recorder events.SessionPreparerRecorder
 }
 
 // Check validates the config.
 func (c *AuditConfig) Check() error {
 	if c.Emitter == nil {
 		return trace.BadParameter("missing Emitter")
+	}
+	if c.Recorder == nil {
+		return trace.BadParameter("missing Recorder")
 	}
 	return nil
 }
@@ -77,8 +85,16 @@ func NewAudit(config AuditConfig) (Audit, error) {
 	}
 	return &audit{
 		cfg: config,
-		log: logrus.WithField(trace.Component, "app:audit"),
+		log: logrus.WithField(teleport.ComponentKey, "app:audit"),
 	}, nil
+}
+
+func getSessionMetadata(identity *tlsca.Identity) apievents.SessionMetadata {
+	return apievents.SessionMetadata{
+		SessionID:        identity.RouteToApp.SessionID,
+		WithMFA:          identity.MFAVerified,
+		PrivateKeyPolicy: string(identity.PrivateKeyPolicy),
+	}
 }
 
 // OnSessionStart is called when new app session starts.
@@ -93,11 +109,8 @@ func (a *audit) OnSessionStart(ctx context.Context, serverID string, identity *t
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		ConnectionMetadata: apievents.ConnectionMetadata{
 			RemoteAddr: identity.LoginIP,
 		},
@@ -122,11 +135,8 @@ func (a *audit) OnSessionEnd(ctx context.Context, serverID string, identity *tls
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		ConnectionMetadata: apievents.ConnectionMetadata{
 			RemoteAddr: identity.LoginIP,
 		},
@@ -151,11 +161,8 @@ func (a *audit) OnSessionChunk(ctx context.Context, serverID, chunkID string, id
 			ServerID:        serverID,
 			ServerNamespace: apidefaults.Namespace,
 		},
-		SessionMetadata: apievents.SessionMetadata{
-			SessionID: identity.RouteToApp.SessionID,
-			WithMFA:   identity.MFAVerified,
-		},
-		UserMetadata: identity.GetUserMetadata(),
+		SessionMetadata: getSessionMetadata(identity),
+		UserMetadata:    identity.GetUserMetadata(),
 		AppMetadata: apievents.AppMetadata{
 			AppURI:        app.GetURI(),
 			AppPublicAddr: app.GetPublicAddr(),
@@ -214,8 +221,21 @@ func (a *audit) OnDynamoDBRequest(ctx context.Context, sessionCtx *SessionContex
 }
 
 // EmitEvent emits the provided audit event.
-func (a *audit) EmitEvent(ctx context.Context, event apievents.AuditEvent) error {
-	return trace.Wrap(a.cfg.Emitter.EmitAuditEvent(ctx, event))
+func (a *audit) EmitEvent(ctx context.Context, e apievents.AuditEvent) error {
+	preparedEvent, err := a.cfg.Recorder.PrepareSessionEvent(e)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	recErr := a.cfg.Recorder.RecordEvent(ctx, preparedEvent)
+	event := preparedEvent.GetAuditEvent()
+	var emitErr error
+	// AppSessionRequest events should only go to session recording
+	if event.GetType() != events.AppSessionRequestEvent {
+		emitErr = a.cfg.Emitter.EmitAuditEvent(ctx, event)
+	}
+
+	return trace.NewAggregate(recErr, emitErr)
 }
 
 // MakeAppMetadata returns common server metadata for database session.

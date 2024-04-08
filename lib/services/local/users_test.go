@@ -1,43 +1,52 @@
-/**
- * Copyright 2021 Gravitational, Inc.
+/*
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 package local_test
 
 import (
 	"context"
-	"crypto/x509"
+	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/bcrypt"
 
+	userspb "github.com/gravitational/teleport/api/gen/proto/go/teleport/users/v1"
 	"github.com/gravitational/teleport/api/types"
-	wantypes "github.com/gravitational/teleport/api/types/webauthn"
 	"github.com/gravitational/teleport/api/utils/keys"
-	"github.com/gravitational/teleport/lib/auth/native"
+	wantypes "github.com/gravitational/teleport/lib/auth/webauthntypes"
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/backend/memory"
+	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/services/local"
 )
 
@@ -45,10 +54,10 @@ func newIdentityService(t *testing.T, clock clockwork.Clock) *local.IdentityServ
 	t.Helper()
 	backend, err := memory.New(memory.Config{
 		Context: context.Background(),
-		Clock:   clockwork.NewFakeClock(),
+		Clock:   clock,
 	})
 	require.NoError(t, err)
-	return local.NewIdentityService(backend)
+	return local.NewTestIdentityService(backend)
 }
 
 func TestRecoveryCodesCRUD(t *testing.T) {
@@ -109,7 +118,7 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource := &types.UserV2{}
 		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
+		_, err := identity.CreateUser(ctx, userResource)
 		require.NoError(t, err)
 
 		// Test codes exist for user.
@@ -135,14 +144,14 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource1 := &types.UserV2{}
 		userResource1.SetName(username1)
-		err := identity.CreateUser(userResource1)
+		_, err := identity.CreateUser(ctx, userResource1)
 		require.NoError(t, err)
 
 		// Create another user whose username which is prefixed with
 		// the previous username.
 		userResource2 := &types.UserV2{}
 		userResource2.SetName(username2)
-		err = identity.CreateUser(userResource2)
+		_, err = identity.CreateUser(ctx, userResource2)
 		require.NoError(t, err)
 
 		// Test codes exist for the first user.
@@ -184,7 +193,7 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		// Create a user.
 		userResource := &types.UserV2{}
 		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
+		_, err := identity.CreateUser(ctx, userResource)
 		require.NoError(t, err)
 
 		// Test codes exist for user.
@@ -201,67 +210,6 @@ func TestRecoveryCodesCRUD(t *testing.T) {
 		require.NoError(t, err)
 		_, err = identity.GetRecoveryCodes(ctx, username, true /* withSecrets */)
 		require.True(t, trace.IsNotFound(err))
-	})
-}
-
-func TestRecoveryAttemptsCRUD(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	clock := clockwork.NewFakeClock()
-	identity := newIdentityService(t, clock)
-
-	// Predefine times for equality check.
-	time1 := clock.Now()
-	time2 := time1.Add(2 * time.Minute)
-	time3 := time1.Add(4 * time.Minute)
-
-	t.Run("create, get, and delete recovery attempts", func(t *testing.T) {
-		username := "someuser"
-
-		// Test creation of recovery attempt.
-		err := identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time3, Expires: time3})
-		require.NoError(t, err)
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time1, Expires: time3})
-		require.NoError(t, err)
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time2, Expires: time3})
-		require.NoError(t, err)
-
-		// Test retrieving attempts sorted by oldest to latest.
-		attempts, err := identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 3)
-		require.WithinDuration(t, time1, attempts[0].Time, time.Second)
-		require.WithinDuration(t, time2, attempts[1].Time, time.Second)
-		require.WithinDuration(t, time3, attempts[2].Time, time.Second)
-
-		// Test delete all recovery attempts.
-		err = identity.DeleteUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		attempts, err = identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 0)
-	})
-
-	t.Run("deleting user deletes recovery attempts", func(t *testing.T) {
-		username := "someuser2"
-
-		// Create a user, to test deletion of recovery attempts with user.
-		userResource := &types.UserV2{}
-		userResource.SetName(username)
-		err := identity.CreateUser(userResource)
-		require.NoError(t, err)
-
-		err = identity.CreateUserRecoveryAttempt(ctx, username, &types.RecoveryAttempt{Time: time3, Expires: time3})
-		require.NoError(t, err)
-		attempts, err := identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 1)
-
-		err = identity.DeleteUser(ctx, username)
-		require.NoError(t, err)
-		attempts, err = identity.GetUserRecoveryAttempts(ctx, username)
-		require.NoError(t, err)
-		require.Len(t, attempts, 0)
 	})
 }
 
@@ -461,7 +409,7 @@ func TestIdentityService_UpsertMFADevice_errors(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			err := identity.UpsertMFADevice(ctx, user, test.createDev())
-			require.NotNil(t, err)
+			require.Error(t, err)
 			require.Contains(t, err.Error(), test.wantErr)
 		})
 	}
@@ -483,11 +431,11 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 		las.Webauthn = wal
 		u.SetLocalAuth(las)
 
-		err = identity.UpsertUser(u)
+		_, err = identity.UpsertUser(ctx, u)
 		return err
 	}
 	getViaUser := func(ctx context.Context, user string) (*types.WebauthnLocalAuth, error) {
-		u, err := identity.GetUser(user, true /* withSecrets */)
+		u, err := identity.GetUser(ctx, user, true /* withSecrets */)
 		if err != nil {
 			return nil, err
 		}
@@ -495,15 +443,15 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 	}
 
 	// Create a user to begin with.
+	ctx := context.Background()
 	const name = "llama"
 	user, err := types.NewUser(name)
 	require.NoError(t, err)
-	err = identity.UpsertUser(user)
+	_, err = identity.UpsertUser(ctx, user)
 	require.NoError(t, err)
 
 	// Try a few empty reads.
-	ctx := context.Background()
-	_, err = identity.GetUser(name, true /* withSecrets */)
+	_, err = identity.GetUser(ctx, name, true /* withSecrets */)
 	require.NoError(t, err) // User read should be fine.
 	_, err = identity.GetWebauthnLocalAuth(ctx, name)
 	require.True(t, trace.IsNotFound(err)) // Direct WAL read should fail.
@@ -513,7 +461,7 @@ func TestIdentityService_UpsertWebauthnLocalAuth(t *testing.T) {
 	err = identity.UpsertWebauthnLocalAuth(ctx, name, badWAL)
 	require.True(t, trace.IsBadParameter(err))
 	user.SetLocalAuth(&types.LocalAuthSecrets{Webauthn: badWAL})
-	err = identity.UpdateUser(ctx, user)
+	_, err = identity.UpdateUser(ctx, user)
 	require.True(t, trace.IsBadParameter(err))
 
 	// Update/Read tests.
@@ -765,6 +713,7 @@ func TestIdentityService_UpsertGlobalWebauthnSessionData_maxLimit(t *testing.T) 
 		local.GlobalSessionDataMaxEntries = sdMax
 		local.SessionDataLimiter.Clock = sdClock
 		local.SessionDataLimiter.ResetPeriod = sdReset
+		local.SessionDataLimiter.Reset()
 	}()
 	fakeClock := clockwork.NewFakeClock()
 	period := 1 * time.Minute // arbitrary, applied to fakeClock
@@ -772,8 +721,10 @@ func TestIdentityService_UpsertGlobalWebauthnSessionData_maxLimit(t *testing.T) 
 	local.SessionDataLimiter.Clock = fakeClock
 	local.SessionDataLimiter.ResetPeriod = period
 
-	const scopeLogin = "login"
-	const scopeOther = "other"
+	// Add some randomness to the scopes to avoid high -count runs tripping on
+	// each other.
+	scopeLogin := "login" + uuid.NewString()
+	scopeOther := "other" + uuid.NewString()
 	const id1 = "challenge1"
 	const id2 = "challenge2"
 	const id3 = "challenge3"
@@ -892,49 +843,390 @@ Tirv9LjajEBxUnuV+wIDAQAB
 			err := identity.UpsertKeyAttestationData(ctx, attestationData, time.Hour)
 			require.NoError(t, err, "UpsertKeyAttestationData failed")
 
-			pub, err := x509.ParsePKIXPublicKey(pubDer)
-			require.NoError(t, err, "ParsePKIXPublicKey failed")
-
-			retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, pub)
+			retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, pubDer)
 			require.NoError(t, err, "GetKeyAttestationData failed")
 			require.Equal(t, attestationData, retrievedAttestationData, "GetKeyAttestationData mismatch")
 		})
 	}
 }
 
-// DELETE IN 13.0, old fingerprints not in use by then (Joerger).
-func TestIdentityService_GetKeyAttestationDataV11Fingerprint(t *testing.T) {
+func TestIdentityService_UpdateAndSwapUser(t *testing.T) {
 	t.Parallel()
 	identity := newIdentityService(t, clockwork.NewFakeClock())
 	ctx := context.Background()
 
-	key, err := native.GenerateRSAPrivateKey()
-	require.NoError(t, err)
-
-	pubDER, err := x509.MarshalPKIXPublicKey(key.Public())
-	require.NoError(t, err)
-
-	attestationData := &keys.AttestationData{
-		PrivateKeyPolicy: keys.PrivateKeyPolicyNone,
-		PublicKeyDER:     pubDER,
+	type updateParams struct {
+		user        string
+		withSecrets bool
+		fn          func(u types.User) (changed bool, err error)
 	}
 
-	// manually insert attestation data with old style fingerprint.
-	value, err := json.Marshal(attestationData)
-	require.NoError(t, err)
-
-	backendKey, err := local.KeyAttestationDataFingerprintV11(key.Public())
-	require.NoError(t, err)
-
-	item := backend.Item{
-		Key:   backend.Key("key_attestations", backendKey),
-		Value: value,
+	tests := []struct {
+		name     string
+		makeUser func() (types.User, error) // if not nil, the user is created
+		updateParams
+		wantErr  string
+		wantNoop bool
+	}{
+		{
+			name: "update without secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateNoSecrets1")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "update without secrets can't write secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateNoSecrets2")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					u.SetLocalAuth(&types.LocalAuthSecrets{
+						Webauthn: &types.WebauthnLocalAuth{
+							UserID: []byte("superwebllama"),
+						},
+					})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "update with secrets",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("updateWithSecrets")
+			},
+			updateParams: updateParams{
+				withSecrets: true,
+				fn: func(u types.User) (bool, error) {
+					u.SetLogins([]string{"llama", "alpaca"})
+					u.SetLocalAuth(&types.LocalAuthSecrets{
+						Webauthn: &types.WebauthnLocalAuth{
+							UserID: []byte("superwebllama"),
+						},
+					})
+					return true, nil
+				},
+			},
+		},
+		{
+			name: "noop fn",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("noop1")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (changed bool, err error) {
+					u.SetLogins([]string{"llama"}) // not written to storage!
+					return false, nil
+				},
+			},
+			wantNoop: true,
+		},
+		{
+			name: "user not found",
+			updateParams: updateParams{
+				user: "unknown",
+				fn:   func(u types.User) (changed bool, err error) { return false, nil },
+			},
+			wantErr: "not found",
+		},
+		{
+			name: "fn error surfaced",
+			makeUser: func() (types.User, error) {
+				return types.NewUser("fnErr")
+			},
+			updateParams: updateParams{
+				fn: func(u types.User) (changed bool, err error) {
+					return false, errors.New("something really terrible happened")
+				},
+			},
+			wantErr: "something really terrible",
+		},
 	}
-	_, err = identity.Put(ctx, item)
-	require.NoError(t, err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var before types.User
 
-	// Should be able to retrieve attestation data despite old fingerprint.
-	retrievedAttestationData, err := identity.GetKeyAttestationData(ctx, key.Public())
-	require.NoError(t, err)
-	require.Equal(t, attestationData, retrievedAttestationData)
+			// Create user?
+			if test.makeUser != nil {
+				var err error
+				before, err = test.makeUser()
+				require.NoError(t, err, "makeUser failed")
+				_, err = identity.CreateUser(ctx, before)
+				require.NoError(t, err, "CreateUser failed")
+
+				if test.user == "" {
+					test.user = before.GetName()
+				} else if test.user != before.GetName() {
+					t.Fatal("Test has both makeUser and updateParams.user, but they don't match")
+				}
+			}
+
+			updated, err := identity.UpdateAndSwapUser(ctx, test.user, test.withSecrets, test.fn)
+			if test.wantErr != "" {
+				assert.ErrorContains(t, err, test.wantErr, "UpdateAndSwapUser didn't error")
+				return
+			}
+
+			// Determine wanted user based on `before` and params.
+			want := before
+			if !test.wantNoop {
+				test.fn(want)
+			}
+			if !test.withSecrets {
+				want = want.WithoutSecrets().(types.User)
+			}
+
+			// Assert update response.
+			if diff := cmp.Diff(want, updated, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")); diff != "" {
+				t.Errorf("UpdateAndSwapUser return mismatch (-want +got)\n%s", diff)
+			}
+
+			// Assert stored.
+			stored, err := identity.GetUser(ctx, test.user, test.withSecrets)
+			require.NoError(t, err, "GetUser failed")
+			if diff := cmp.Diff(want, stored, cmpopts.IgnoreFields(types.Metadata{}, "ID", "Revision")); diff != "" {
+				t.Errorf("UpdateAndSwapUser storage mismatch (-want +got)\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestIdentityService_ListUsers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	clock := clockwork.NewFakeClock()
+	identity := newIdentityService(t, clock)
+
+	password, err := bcrypt.GenerateFromPassword([]byte("insecure"), bcrypt.MinCost)
+	require.NoError(t, err, "creating password failed")
+
+	dev1, err := services.NewTOTPDevice("otp1", base32.StdEncoding.EncodeToString([]byte("abc123")), time.Now())
+	require.NoError(t, err, "creating otp device failed")
+	dev2, err := services.NewTOTPDevice("otp2", base32.StdEncoding.EncodeToString([]byte("xyz789")), time.Now())
+	require.NoError(t, err, "creating otp device failed")
+
+	// Validate that no users returns an empty page.
+	rsp, err := identity.ListUsers(ctx, &userspb.ListUsersRequest{})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.Users, "users returned from listing when no users exist")
+	assert.Empty(t, rsp.NextPageToken, "next page token returned from listing when no users exist")
+
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{
+		WithSecrets: true,
+	})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.Users, "users returned from listing when no users exist")
+	assert.Empty(t, rsp.NextPageToken, "next page token returned from listing when no users exist")
+
+	// Validate that listing works when there is only a single user
+	user, err := types.NewUser("fish0")
+	require.NoError(t, err, "creating new user %s", user)
+
+	user, err = identity.CreateUser(ctx, user)
+	require.NoError(t, err, "creating user %s failed", user)
+	expectedUsers := []*types.UserV2{user.(*types.UserV2)}
+
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.NextPageToken, "next page token returned from listing when no more users exist")
+	assert.Empty(t, cmp.Diff(expectedUsers, rsp.Users, cmpopts.IgnoreFields(types.UserSpecV2{}, "LocalAuth")), "not all users returned from listing operation")
+
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{})
+	assert.NoError(t, err, "no error returned when no users exist")
+	assert.Empty(t, rsp.NextPageToken, "next page token returned from listing when no users exist")
+	assert.Empty(t, cmp.Diff(expectedUsers, rsp.Users), "not all users returned from listing operation")
+
+	// Create a number of users.
+	usernames := []string{"llama", "alpaca", "fox", "fish", "fish+", "fish2"}
+	for i, name := range usernames {
+		user, err := types.NewUser(name)
+		require.NoError(t, err, "creating new user %s", name)
+
+		// Set varying number of devices so the listing logic
+		// doesn't cleanly land on a user resource.
+		devices := []*types.MFADevice{dev1}
+		switch {
+		case i%2 == 0:
+			devices = append(devices, dev2)
+		case i == 3:
+			devices = nil
+		case i == 1:
+			devices = append(devices, dev2)
+			for j := 0; j < 20; j++ {
+				dev, err := services.NewTOTPDevice(uuid.NewString(), base32.StdEncoding.EncodeToString([]byte("abc123")), time.Now())
+				require.NoError(t, err, "creating otp device failed")
+				devices = append(devices, dev)
+			}
+		}
+
+		user.SetLocalAuth(&types.LocalAuthSecrets{
+			PasswordHash: password,
+			MFA:          devices,
+		})
+
+		created, err := identity.CreateUser(ctx, user)
+		require.NoError(t, err, "creating user %s failed", user)
+		expectedUsers = append(expectedUsers, created.(*types.UserV2))
+	}
+	slices.SortFunc(expectedUsers, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+
+	// List a few users at a time and validate that all users are eventually returned.
+	var retrieved []*types.UserV2
+	req := userspb.ListUsersRequest{
+		PageSize: 2,
+	}
+	for {
+		rsp, err := identity.ListUsers(ctx, &req)
+		require.NoError(t, err, "no error returned when no users exist")
+
+		for _, user := range rsp.Users {
+			assert.Empty(t, user.GetLocalAuth(), "expected no secrets to be returned with user %s", user.GetName())
+		}
+
+		retrieved = append(retrieved, rsp.Users...)
+
+		req.PageToken = rsp.NextPageToken
+		if req.PageToken == "" {
+			break
+		}
+
+		if len(retrieved) > len(expectedUsers) {
+			t.Fatalf("listing users has accumulated %d users even though only %d users exist", len(retrieved), len(expectedUsers))
+		}
+	}
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	assert.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.IgnoreFields(types.UserSpecV2{}, "LocalAuth")), "not all users returned from listing operation")
+
+	// Validate that listing all users at once returns all expected users with secrets.
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{
+		PageSize:    200,
+		WithSecrets: true,
+	})
+	require.NoError(t, err, "unexpected error listing users")
+	assert.Empty(t, rsp.NextPageToken, "got a next page token when page size was greater than number of items")
+
+	users := rsp.Users
+
+	slices.SortFunc(users, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+
+	devicesSort := func(a *types.MFADevice, b *types.MFADevice) bool { return a.GetName() < b.GetName() }
+
+	require.Empty(t, cmp.Diff(expectedUsers, users, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+
+	// List a few users at a time and validate that all users are eventually returned with their secrets.
+	retrieved = nil
+	req = userspb.ListUsersRequest{
+		PageSize:    2,
+		WithSecrets: true,
+	}
+	for {
+		rsp, err := identity.ListUsers(ctx, &req)
+		require.NoError(t, err, "no error returned when no users exist")
+
+		retrieved = append(retrieved, rsp.Users...)
+
+		req.PageToken = rsp.NextPageToken
+		if req.PageToken == "" {
+			break
+		}
+
+		if len(retrieved) > len(expectedUsers) {
+			t.Fatalf("listing users has accumulated %d users even though only %d users exist", len(retrieved), len(expectedUsers))
+		}
+	}
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	require.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+
+	ssoUser := expectedUsers[2]
+	expectedUsers = slices.Delete(expectedUsers, 2, 3)
+	ssoUser.SetExpiry(clock.Now().UTC().Add(time.Minute))
+
+	_, err = identity.UpsertUser(ctx, ssoUser)
+	assert.NoError(t, err, "failed to upsert SSO user")
+
+	clock.Advance(time.Hour)
+
+	rsp, err = identity.ListUsers(ctx, &userspb.ListUsersRequest{
+		WithSecrets: true,
+	})
+	assert.NoError(t, err, "got an error while listing over an expired user")
+	assert.Empty(t, rsp.NextPageToken, "next page token returned from listing all users")
+
+	retrieved = rsp.Users
+
+	slices.SortFunc(retrieved, func(a, b *types.UserV2) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
+	require.Empty(t, cmp.Diff(expectedUsers, retrieved, cmpopts.SortSlices(devicesSort)), "not all users returned from listing operation")
+}
+
+func TestCompareAndSwapUser(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	ctx := context.Background()
+
+	identity := newIdentityService(t, clockwork.NewFakeClock())
+
+	bob1, err := types.NewUser("bob")
+	require.NoError(err)
+	bob1.SetLogins([]string{"bob"})
+
+	bob2, err := types.NewUser("bob")
+	require.NoError(err)
+	bob2.SetLogins([]string{"bob", "alice"})
+
+	require.False(services.UsersEquals(bob1, bob2))
+
+	currentBob, err := identity.UpsertUser(ctx, bob1)
+	require.NoError(err)
+	require.True(services.UsersEquals(currentBob, bob1))
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(services.UsersEquals(currentBob, bob1))
+
+	err = identity.CompareAndSwapUser(ctx, bob2, bob1)
+	require.NoError(err)
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(services.UsersEquals(currentBob, bob2))
+
+	item, err := identity.Backend.Get(ctx, backend.Key(local.WebPrefix, local.UsersPrefix, "bob", local.ParamsPrefix))
+	require.NoError(err)
+	var m map[string]any
+	require.NoError(json.Unmarshal(item.Value, &m))
+	m["deprecated_field"] = 42
+	item.Value, err = json.Marshal(m)
+	require.NoError(err)
+	_, err = identity.Backend.Put(ctx, *item)
+	require.NoError(err)
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(services.UsersEquals(currentBob, bob2))
+
+	err = identity.CompareAndSwapUser(ctx, bob1, bob2)
+	require.NoError(err)
+
+	currentBob, err = identity.GetUser(ctx, "bob", false)
+	require.NoError(err)
+	require.True(services.UsersEquals(currentBob, bob1))
 }

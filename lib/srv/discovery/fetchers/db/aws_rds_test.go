@@ -1,36 +1,36 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package db
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/rds"
 	"github.com/aws/aws-sdk-go/service/rds/rdsiface"
-	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/cloud"
-	libcloudaws "github.com/gravitational/teleport/lib/cloud/aws"
 	"github.com/gravitational/teleport/lib/cloud/mocks"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/srv/discovery/common"
 )
 
 // TestRDSFetchers tests RDS instance fetcher and Aurora cluster fetcher (as
@@ -47,13 +47,13 @@ func TestRDSFetchers(t *testing.T) {
 	rdsInstanceUnavailable, _ := makeRDSInstance(t, "instance-5", "us-west-1", nil, withRDSInstanceStatus("stopped"))
 	rdsInstanceUnknownStatus, rdsDatabaseUnknownStatus := makeRDSInstance(t, "instance-5", "us-west-6", nil, withRDSInstanceStatus("status-does-not-exist"))
 
-	auroraCluster1, auroraDatabase1 := makeRDSCluster(t, "cluster-1", "us-east-1", envProdLabels)
-	auroraCluster2, auroraDatabases2 := makeRDSClusterWithExtraEndpoints(t, "cluster-2", "us-east-2", envDevLabels, true)
-	auroraCluster3, auroraDatabase3 := makeRDSCluster(t, "cluster-3", "us-east-2", envProdLabels)
-	auroraClusterUnsupported, _ := makeRDSCluster(t, "serverless", "us-east-1", nil, withRDSClusterEngineMode("serverless"))
-	auroraClusterUnavailable, _ := makeRDSCluster(t, "cluster-4", "us-east-1", nil, withRDSClusterStatus("creating"))
-	auroraClusterUnknownStatus, auroraDatabaseUnknownStatus := makeRDSCluster(t, "cluster-5", "us-east-1", nil, withRDSClusterStatus("status-does-not-exist"))
-	auroraClusterNoWriter, auroraDatabasesNoWriter := makeRDSClusterWithExtraEndpoints(t, "cluster-6", "us-east-1", envDevLabels, false)
+	auroraCluster1, auroraCluster1MemberInstance, auroraDatabase1 := makeRDSCluster(t, "cluster-1", "us-east-1", envProdLabels)
+	auroraCluster2, auroraCluster2MemberInstance, auroraDatabases2 := makeRDSClusterWithExtraEndpoints(t, "cluster-2", "us-east-2", envDevLabels, true)
+	auroraCluster3, auroraCluster3MemberInstance, auroraDatabase3 := makeRDSCluster(t, "cluster-3", "us-east-2", envProdLabels)
+	auroraClusterUnsupported, _, _ := makeRDSCluster(t, "serverless", "us-east-1", nil, withRDSClusterEngineMode("serverless"))
+	auroraClusterUnavailable, _, _ := makeRDSCluster(t, "cluster-4", "us-east-1", nil, withRDSClusterStatus("creating"))
+	auroraClusterUnknownStatus, auroraClusterUnknownStatusMemberInstance, auroraDatabaseUnknownStatus := makeRDSCluster(t, "cluster-5", "us-east-1", nil, withRDSClusterStatus("status-does-not-exist"))
+	auroraClusterNoWriter, auroraClusterMemberNoWriter, auroraDatabasesNoWriter := makeRDSClusterWithExtraEndpoints(t, "cluster-6", "us-east-1", envDevLabels, false)
 
 	tests := []awsFetcherTest{
 		{
@@ -61,25 +61,25 @@ func TestRDSFetchers(t *testing.T) {
 			inputClients: &cloud.TestCloudClients{
 				RDSPerRegion: map[string]rdsiface.RDSAPI{
 					"us-east-1": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3},
+						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3, auroraCluster1MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster1},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine, postgresEngine},
 					},
 					"us-east-2": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance2},
+						DBInstances:      []*rds.DBInstance{rdsInstance2, auroraCluster2MemberInstance, auroraCluster3MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster2, auroraCluster3},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine, postgresEngine},
 					},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{
+			inputMatchers: []types.AWSMatcher{
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-1"},
 					Tags:    toTypeLabels(wildcardLabels),
 				},
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-2"},
 					Tags:    toTypeLabels(wildcardLabels),
 				},
@@ -94,25 +94,25 @@ func TestRDSFetchers(t *testing.T) {
 			inputClients: &cloud.TestCloudClients{
 				RDSPerRegion: map[string]rdsiface.RDSAPI{
 					"us-east-1": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3},
+						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3, auroraCluster1MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster1},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine, postgresEngine},
 					},
 					"us-east-2": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance2},
+						DBInstances:      []*rds.DBInstance{rdsInstance2, auroraCluster2MemberInstance, auroraCluster3MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster2, auroraCluster3},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine, postgresEngine},
 					},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{
+			inputMatchers: []types.AWSMatcher{
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-1"},
 					Tags:    toTypeLabels(envProdLabels),
 				},
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-2"},
 					Tags:    toTypeLabels(envDevLabels),
 				},
@@ -127,25 +127,25 @@ func TestRDSFetchers(t *testing.T) {
 			inputClients: &cloud.TestCloudClients{
 				RDSPerRegion: map[string]rdsiface.RDSAPI{
 					"us-east-1": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3},
+						DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstance3, auroraCluster1MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster1},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine},
 					},
 					"us-east-2": &mocks.RDSMock{
-						DBInstances:      []*rds.DBInstance{rdsInstance2},
+						DBInstances:      []*rds.DBInstance{rdsInstance2, auroraCluster2MemberInstance, auroraCluster3MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster2, auroraCluster3},
 						DBEngineVersions: []*rds.DBEngineVersion{postgresEngine},
 					},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{
+			inputMatchers: []types.AWSMatcher{
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-1"},
 					Tags:    toTypeLabels(wildcardLabels),
 				},
 				{
-					Types:   []string{services.AWSMatcherRDS},
+					Types:   []string{types.AWSMatcherRDS},
 					Regions: []string{"us-east-2"},
 					Tags:    toTypeLabels(wildcardLabels),
 				},
@@ -157,13 +157,14 @@ func TestRDSFetchers(t *testing.T) {
 			inputClients: &cloud.TestCloudClients{
 				RDSPerRegion: map[string]rdsiface.RDSAPI{
 					"us-east-1": &mocks.RDSMock{
+						DBInstances:      []*rds.DBInstance{auroraCluster1MemberInstance},
 						DBClusters:       []*rds.DBCluster{auroraCluster1, auroraClusterUnsupported},
 						DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine},
 					},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{{
-				Types:   []string{services.AWSMatcherRDS},
+			inputMatchers: []types.AWSMatcher{{
+				Types:   []string{types.AWSMatcherRDS},
 				Regions: []string{"us-east-1"},
 				Tags:    toTypeLabels(wildcardLabels),
 			}},
@@ -173,13 +174,13 @@ func TestRDSFetchers(t *testing.T) {
 			name: "skip unavailable databases",
 			inputClients: &cloud.TestCloudClients{
 				RDS: &mocks.RDSMock{
-					DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstanceUnavailable, rdsInstanceUnknownStatus},
+					DBInstances:      []*rds.DBInstance{rdsInstance1, rdsInstanceUnavailable, rdsInstanceUnknownStatus, auroraCluster1MemberInstance, auroraClusterUnknownStatusMemberInstance},
 					DBClusters:       []*rds.DBCluster{auroraCluster1, auroraClusterUnavailable, auroraClusterUnknownStatus},
 					DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine, postgresEngine},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{{
-				Types:   []string{services.AWSMatcherRDS},
+			inputMatchers: []types.AWSMatcher{{
+				Types:   []string{types.AWSMatcherRDS},
 				Regions: []string{"us-east-1"},
 				Tags:    toTypeLabels(wildcardLabels),
 			}},
@@ -190,11 +191,12 @@ func TestRDSFetchers(t *testing.T) {
 			inputClients: &cloud.TestCloudClients{
 				RDS: &mocks.RDSMock{
 					DBClusters:       []*rds.DBCluster{auroraClusterNoWriter},
+					DBInstances:      []*rds.DBInstance{auroraClusterMemberNoWriter},
 					DBEngineVersions: []*rds.DBEngineVersion{auroraMySQLEngine},
 				},
 			},
-			inputMatchers: []services.AWSMatcher{{
-				Types:   []string{services.AWSMatcherRDS},
+			inputMatchers: []types.AWSMatcher{{
+				Types:   []string{types.AWSMatcherRDS},
 				Regions: []string{"us-east-1"},
 				Tags:    toTypeLabels(wildcardLabels),
 			}},
@@ -205,93 +207,73 @@ func TestRDSFetchers(t *testing.T) {
 }
 
 func makeRDSInstance(t *testing.T, name, region string, labels map[string]string, opts ...func(*rds.DBInstance)) (*rds.DBInstance, types.Database) {
-	instance := &rds.DBInstance{
-		DBInstanceArn:        aws.String(fmt.Sprintf("arn:aws:rds:%v:123456789012:db:%v", region, name)),
-		DBInstanceIdentifier: aws.String(name),
-		DbiResourceId:        aws.String(uuid.New().String()),
-		Engine:               aws.String(services.RDSEnginePostgres),
-		DBInstanceStatus:     aws.String("available"),
-		Endpoint: &rds.Endpoint{
-			Address: aws.String("localhost"),
-			Port:    aws.Int64(5432),
-		},
-		TagList: libcloudaws.LabelsToTags[rds.Tag](labels),
-	}
-	for _, opt := range opts {
-		opt(instance)
-	}
-
+	instance := mocks.RDSInstance(name, region, labels, opts...)
 	database, err := services.NewDatabaseFromRDSInstance(instance)
 	require.NoError(t, err)
+	common.ApplyAWSDatabaseNameSuffix(database, types.AWSMatcherRDS)
 	return instance, database
 }
 
-func makeRDSCluster(t *testing.T, name, region string, labels map[string]string, opts ...func(*rds.DBCluster)) (*rds.DBCluster, types.Database) {
-	cluster := &rds.DBCluster{
-		DBClusterArn:        aws.String(fmt.Sprintf("arn:aws:rds:%v:123456789012:cluster:%v", region, name)),
-		DBClusterIdentifier: aws.String(name),
-		DbClusterResourceId: aws.String(uuid.New().String()),
-		Engine:              aws.String(services.RDSEngineAuroraMySQL),
-		EngineMode:          aws.String(services.RDSEngineModeProvisioned),
-		Status:              aws.String("available"),
-		Endpoint:            aws.String("localhost"),
-		Port:                aws.Int64(3306),
-		TagList:             libcloudaws.LabelsToTags[rds.Tag](labels),
-		DBClusterMembers: []*rds.DBClusterMember{&rds.DBClusterMember{
-			IsClusterWriter: aws.Bool(true), // Only one writer.
-		}},
-	}
-	for _, opt := range opts {
-		opt(cluster)
-	}
-
-	database, err := services.NewDatabaseFromRDSCluster(cluster)
+func makeRDSCluster(t *testing.T, name, region string, labels map[string]string, opts ...func(*rds.DBCluster)) (*rds.DBCluster, *rds.DBInstance, types.Database) {
+	cluster := mocks.RDSCluster(name, region, labels, opts...)
+	dbInstanceMember := makeRDSMemberForCluster(t, name, region, "vpc-123", *cluster.Engine, labels)
+	database, err := services.NewDatabaseFromRDSCluster(cluster, []*rds.DBInstance{dbInstanceMember})
 	require.NoError(t, err)
-	return cluster, database
+	common.ApplyAWSDatabaseNameSuffix(database, types.AWSMatcherRDS)
+	return cluster, dbInstanceMember, database
 }
 
-func makeRDSClusterWithExtraEndpoints(t *testing.T, name, region string, labels map[string]string, hasWriter bool) (*rds.DBCluster, types.Databases) {
-	cluster := &rds.DBCluster{
-		DBClusterArn:        aws.String(fmt.Sprintf("arn:aws:rds:%v:123456789012:cluster:%v", region, name)),
-		DBClusterIdentifier: aws.String(name),
-		DbClusterResourceId: aws.String(uuid.New().String()),
-		Engine:              aws.String(services.RDSEngineAuroraMySQL),
-		EngineMode:          aws.String(services.RDSEngineModeProvisioned),
-		Status:              aws.String("available"),
-		Endpoint:            aws.String("localhost"),
-		ReaderEndpoint:      aws.String("reader.host"),
-		Port:                aws.Int64(3306),
-		TagList:             libcloudaws.LabelsToTags[rds.Tag](labels),
-		DBClusterMembers: []*rds.DBClusterMember{&rds.DBClusterMember{
-			IsClusterWriter: aws.Bool(false), // Add reader by default. Writer is added below based on hasWriter.
-		}},
-		CustomEndpoints: []*string{
-			aws.String("custom1.cluster-custom-example.us-east-1.rds.amazonaws.com"),
-			aws.String("custom2.cluster-custom-example.us-east-1.rds.amazonaws.com"),
+func makeRDSMemberForCluster(t *testing.T, name, region, vpcid, engine string, labels map[string]string) *rds.DBInstance {
+	instanceRDSMember, _ := makeRDSInstance(t, name+"-instance-1", region, labels, func(d *rds.DBInstance) {
+		if d.DBSubnetGroup == nil {
+			d.DBSubnetGroup = &rds.DBSubnetGroup{}
+		}
+		d.DBSubnetGroup.SetVpcId(vpcid)
+		d.DBClusterIdentifier = aws.String(name)
+		d.Engine = aws.String(engine)
+	})
+
+	return instanceRDSMember
+}
+
+func makeRDSClusterWithExtraEndpoints(t *testing.T, name, region string, labels map[string]string, hasWriter bool) (*rds.DBCluster, *rds.DBInstance, types.Databases) {
+	cluster := mocks.RDSCluster(name, region, labels,
+		func(cluster *rds.DBCluster) {
+			// Disable writer by default. If hasWriter, writer endpoint will be added below.
+			cluster.DBClusterMembers = nil
 		},
-	}
+		mocks.WithRDSClusterReader,
+		mocks.WithRDSClusterCustomEndpoint("custom1"),
+		mocks.WithRDSClusterCustomEndpoint("custom2"),
+	)
 
 	var databases types.Databases
+
+	instanceRDSMember := makeRDSMemberForCluster(t, name, region, "vpc-123", aws.StringValue(cluster.Engine), labels)
+	dbInstanceMembers := []*rds.DBInstance{instanceRDSMember}
 
 	if hasWriter {
 		cluster.DBClusterMembers = append(cluster.DBClusterMembers, &rds.DBClusterMember{
 			IsClusterWriter: aws.Bool(true), // Add writer.
 		})
 
-		primaryDatabase, err := services.NewDatabaseFromRDSCluster(cluster)
+		primaryDatabase, err := services.NewDatabaseFromRDSCluster(cluster, dbInstanceMembers)
 		require.NoError(t, err)
 		databases = append(databases, primaryDatabase)
 	}
 
-	readerDatabase, err := services.NewDatabaseFromRDSClusterReaderEndpoint(cluster)
+	readerDatabase, err := services.NewDatabaseFromRDSClusterReaderEndpoint(cluster, dbInstanceMembers)
 	require.NoError(t, err)
 	databases = append(databases, readerDatabase)
 
-	customDatabases, err := services.NewDatabasesFromRDSClusterCustomEndpoints(cluster)
+	customDatabases, err := services.NewDatabasesFromRDSClusterCustomEndpoints(cluster, dbInstanceMembers)
 	require.NoError(t, err)
 	databases = append(databases, customDatabases...)
 
-	return cluster, databases
+	for _, db := range databases {
+		common.ApplyAWSDatabaseNameSuffix(db, types.AWSMatcherRDS)
+	}
+	return cluster, instanceRDSMember, databases
 }
 
 // withRDSInstanceStatus returns an option function for makeRDSInstance to overwrite status.

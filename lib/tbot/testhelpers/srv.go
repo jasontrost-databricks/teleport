@@ -1,24 +1,25 @@
 /*
-Copyright 2022 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package testhelpers
 
 import (
 	"context"
-	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,57 +27,62 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/gravitational/teleport"
-	"github.com/gravitational/teleport/api/client/proto"
+	headerv1 "github.com/gravitational/teleport/api/gen/proto/go/teleport/header/v1"
+	machineidv1pb "github.com/gravitational/teleport/api/gen/proto/go/teleport/machineid/v1"
 	"github.com/gravitational/teleport/api/types"
 	"github.com/gravitational/teleport/lib/auth"
 	"github.com/gravitational/teleport/lib/auth/authclient"
 	"github.com/gravitational/teleport/lib/config"
+	"github.com/gravitational/teleport/lib/defaults"
 	"github.com/gravitational/teleport/lib/service"
 	"github.com/gravitational/teleport/lib/service/servicecfg"
 	botconfig "github.com/gravitational/teleport/lib/tbot/config"
-	"github.com/gravitational/teleport/lib/tbot/identity"
 	"github.com/gravitational/teleport/lib/utils"
+	"github.com/gravitational/teleport/tool/teleport/testenv"
 )
 
-// from lib/service/listeners.go
-// TODO(espadolini): have the constants exported
-const (
-	listenerAuth        = "auth"
-	listenerProxySSH    = "proxy:ssh"
-	listenerProxyWeb    = "proxy:web"
-	listenerProxyTunnel = "proxy:tunnel"
-)
+type DefaultBotConfigOpts struct {
+	// Makes the bot connect via the Auth Server instead of the Proxy server.
+	UseAuthServer bool
+
+	// Makes the bot accept an Insecure auth or proxy server
+	Insecure bool
+
+	ServiceConfigs botconfig.ServiceConfigs
+}
+
+const AgentJoinToken = "i-am-a-join-token"
 
 // DefaultConfig returns a FileConfig to be used in tests, with random listen
 // addresses that are tied to the listeners returned in the FileDescriptor
 // slice, which should be passed as exported file descriptors to NewTeleport;
 // this is to ensure that we keep the listening socket open, to prevent other
 // processes from using the same port before we're done with it.
-func DefaultConfig(t *testing.T) (*config.FileConfig, []servicecfg.FileDescriptor) {
-	var fds []servicecfg.FileDescriptor
+func DefaultConfig(t *testing.T) (*config.FileConfig, []*servicecfg.FileDescriptor) {
+	var fds []*servicecfg.FileDescriptor
 
 	fc := &config.FileConfig{
 		Global: config.Global{
 			DataDir: t.TempDir(),
 		},
-		Databases: config.Databases{
-			Service: config.Service{
-				EnabledFlag: "true",
-			},
-		},
 		Proxy: config.Proxy{
 			Service: config.Service{
 				EnabledFlag:   "true",
-				ListenAddress: newListener(t, listenerProxySSH, &fds),
+				ListenAddress: testenv.NewTCPListener(t, service.ListenerProxySSH, &fds),
 			},
-			WebAddr:    newListener(t, listenerProxyWeb, &fds),
-			TunAddr:    newListener(t, listenerProxyTunnel, &fds),
-			PublicAddr: []string{"proxy.example.com"},
+			WebAddr:    testenv.NewTCPListener(t, service.ListenerProxyWeb, &fds),
+			TunAddr:    testenv.NewTCPListener(t, service.ListenerProxyTunnel, &fds),
+			KubeAddr:   testenv.NewTCPListener(t, service.ListenerProxyKube, &fds),
+			PublicAddr: []string{"localhost"}, // ListenerProxyWeb port will be appended
 		},
 		Auth: config.Auth{
+			ClusterName: "localhost",
 			Service: config.Service{
 				EnabledFlag:   "true",
-				ListenAddress: newListener(t, listenerAuth, &fds),
+				ListenAddress: testenv.NewTCPListener(t, service.ListenerAuth, &fds),
+			},
+			StaticTokens: config.StaticTokens{
+				config.StaticToken("db:" + AgentJoinToken),
 			},
 		},
 	}
@@ -84,43 +90,8 @@ func DefaultConfig(t *testing.T) (*config.FileConfig, []servicecfg.FileDescripto
 	return fc, fds
 }
 
-// newListener creates a new TCP listener on 127.0.0.1:0, adds it to the
-// FileDescriptor slice (with the specified type) and returns its actual local
-// address as a string (for use in configuration). Takes a pointer to the slice
-// so that it's convenient to call in the middle of a FileConfig or Config
-// struct literal.
-// TODO(espadolini): move this to a more generic place so we can use the same
-// approach in other tests that spin up a TeleportProcess
-func newListener(t *testing.T, ty string, fds *[]servicecfg.FileDescriptor) string {
-	t.Helper()
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer l.Close()
-	addr := l.Addr().String()
-
-	// File() returns a dup of the listener's file descriptor as an *os.File, so
-	// the original net.Listener still needs to be closed.
-	lf, err := l.(*net.TCPListener).File()
-	require.NoError(t, err)
-	// If the file descriptor slice ends up being passed to a TeleportProcess
-	// that successfully starts, listeners will either get "imported" and used
-	// or discarded and closed, this is just an extra safety measure that closes
-	// the listener at the end of the test anyway (the finalizer would do that
-	// anyway, in principle).
-	t.Cleanup(func() { lf.Close() })
-
-	*fds = append(*fds, servicecfg.FileDescriptor{
-		Type:    ty,
-		Address: addr,
-		File:    lf,
-	})
-
-	return addr
-}
-
 // MakeAndRunTestAuthServer creates an auth server useful for testing purposes.
-func MakeAndRunTestAuthServer(t *testing.T, log utils.Logger, fc *config.FileConfig, fds []servicecfg.FileDescriptor) (auth *service.TeleportProcess) {
+func MakeAndRunTestAuthServer(t *testing.T, log utils.Logger, fc *config.FileConfig, fds []*servicecfg.FileDescriptor) (auth *service.TeleportProcess) {
 	t.Helper()
 
 	var err error
@@ -128,15 +99,21 @@ func MakeAndRunTestAuthServer(t *testing.T, log utils.Logger, fc *config.FileCon
 	require.NoError(t, config.ApplyFileConfig(fc, cfg))
 	cfg.FileDescriptors = fds
 	cfg.Log = log
-
 	cfg.CachePolicy.Enabled = false
 	cfg.Proxy.DisableWebInterface = true
+
+	// Disable session recording to avoid flakiness caused by TempDir cleanup.
+	cfg.Auth.SessionRecordingConfig.SetMode(types.RecordOff)
+	// Disable audit log as we don't rely on this in our tests and it can cause
+	// flakiness due to TempDir cleanup.
+	cfg.Auth.NoAudit = true
+
 	auth, err = service.NewTeleport(cfg)
 	require.NoError(t, err)
 	require.NoError(t, auth.Start())
 
 	t.Cleanup(func() {
-		cfg.Log.Info("Cleaning up Auth Server.")
+		cfg.Logger.InfoContext(context.Background(), "Cleaning up Auth Server.")
 		auth.Close()
 	})
 
@@ -148,31 +125,10 @@ func MakeAndRunTestAuthServer(t *testing.T, log utils.Logger, fc *config.FileCon
 	return auth
 }
 
-// MakeBotAuthClient creates a new auth client using a Bot identity.
-func MakeBotAuthClient(t *testing.T, fc *config.FileConfig, ident *identity.Identity) auth.ClientI {
-	t.Helper()
-
-	cfg := servicecfg.MakeDefaultConfig()
-	err := config.ApplyFileConfig(fc, cfg)
-	require.NoError(t, err)
-
-	authConfig := new(authclient.Config)
-	authConfig.TLS, err = ident.TLSConfig(cfg.CipherSuites)
-	require.NoError(t, err)
-
-	authConfig.AuthServers = cfg.AuthServerAddresses()
-	authConfig.Log = cfg.Log
-
-	client, err := authclient.Connect(context.Background(), authConfig)
-	require.NoError(t, err)
-
-	return client
-}
-
 // MakeDefaultAuthClient reimplements the bare minimum needed to create a
 // default root-level auth client for a Teleport server started by
 // MakeAndRunTestAuthServer.
-func MakeDefaultAuthClient(t *testing.T, log utils.Logger, fc *config.FileConfig) auth.ClientI {
+func MakeDefaultAuthClient(t *testing.T, log utils.Logger, fc *config.FileConfig) *auth.Client {
 	t.Helper()
 
 	cfg := servicecfg.MakeDefaultConfig()
@@ -218,47 +174,78 @@ func MakeDefaultAuthClient(t *testing.T, log utils.Logger, fc *config.FileConfig
 }
 
 // MakeBot creates a server-side bot and returns joining parameters.
-func MakeBot(t *testing.T, client auth.ClientI, name string, roles ...string) *proto.CreateBotResponse {
+func MakeBot(t *testing.T, client *auth.Client, name string, roles ...string) (*botconfig.OnboardingConfig, *machineidv1pb.Bot) {
+	ctx := context.TODO()
 	t.Helper()
 
-	bot, err := client.CreateBot(context.Background(), &proto.CreateBotRequest{
-		Name:  name,
-		Roles: roles,
+	b, err := client.BotServiceClient().CreateBot(ctx, &machineidv1pb.CreateBotRequest{
+		Bot: &machineidv1pb.Bot{
+			Metadata: &headerv1.Metadata{
+				Name: name,
+			},
+			Spec: &machineidv1pb.BotSpec{
+				Roles: roles,
+			},
+		},
 	})
-
 	require.NoError(t, err)
-	return bot
+
+	tokenName, err := utils.CryptoRandomHex(defaults.TokenLenBytes)
+	require.NoError(t, err)
+	tok, err := types.NewProvisionTokenFromSpec(
+		tokenName,
+		time.Now().Add(10*time.Minute),
+		types.ProvisionTokenSpecV2{
+			Roles:   []types.SystemRole{types.RoleBot},
+			BotName: b.Metadata.Name,
+		})
+	require.NoError(t, err)
+	err = client.CreateToken(ctx, tok)
+	require.NoError(t, err)
+
+	return &botconfig.OnboardingConfig{
+		TokenValue: tok.GetName(),
+		JoinMethod: types.JoinMethodToken,
+	}, b
 }
 
-// MakeMemoryBotConfig creates a usable bot config from joining parameters. It
-// only writes artifacts to memory and can be further modified if desired.
-func MakeMemoryBotConfig(t *testing.T, fc *config.FileConfig, botParams *proto.CreateBotResponse) *botconfig.BotConfig {
+// DefaultBotConfig creates a usable bot config from joining parameters.
+// By default it:
+// - Has the outputs provided to it via the parameter `outputs`
+// - Runs in oneshot mode
+// - Uses a memory storage destination
+// - Does not verify Proxy WebAPI certificates
+func DefaultBotConfig(
+	t *testing.T,
+	fc *config.FileConfig,
+	onboarding *botconfig.OnboardingConfig,
+	outputs []botconfig.Output,
+	opts DefaultBotConfigOpts,
+) *botconfig.BotConfig {
 	t.Helper()
 
 	authCfg := servicecfg.MakeDefaultConfig()
 	err := config.ApplyFileConfig(fc, authCfg)
 	require.NoError(t, err)
 
-	cfg := &botconfig.BotConfig{
-		AuthServer: authCfg.AuthServerAddresses()[0].String(),
-		Onboarding: &botconfig.OnboardingConfig{
-			JoinMethod: botParams.JoinMethod,
-		},
-		Storage: &botconfig.StorageConfig{
-			DestinationMixin: botconfig.DestinationMixin{
-				Memory: &botconfig.DestinationMemory{},
-			},
-		},
-		Destinations: []*botconfig.DestinationConfig{
-			{
-				DestinationMixin: botconfig.DestinationMixin{
-					Memory: &botconfig.DestinationMemory{},
-				},
-			},
-		},
+	var authServer = authCfg.Proxy.WebAddr.String()
+	if opts.UseAuthServer {
+		authServer = authCfg.AuthServerAddresses()[0].String()
 	}
 
-	cfg.Onboarding.SetToken(botParams.TokenID)
+	cfg := &botconfig.BotConfig{
+		AuthServer: authServer,
+		Onboarding: *onboarding,
+		Storage: &botconfig.StorageConfig{
+			Destination: &botconfig.DestinationMemory{},
+		},
+		Oneshot: true,
+		Outputs: outputs,
+		// Set Insecure so the bot will trust the Proxy's webapi default signed
+		// certs.
+		Insecure: opts.Insecure,
+		Services: opts.ServiceConfigs,
+	}
 
 	require.NoError(t, cfg.CheckAndSetDefaults())
 

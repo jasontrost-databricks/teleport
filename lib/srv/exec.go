@@ -1,29 +1,33 @@
 /*
-Copyright 2015-2020 Gravitational, Inc.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+ * Teleport
+ * Copyright (C) 2023  Gravitational, Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 
 package srv
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -32,7 +36,6 @@ import (
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/exp/slices"
 
 	"github.com/gravitational/teleport"
 	tracessh "github.com/gravitational/teleport/api/observability/tracing/ssh"
@@ -40,6 +43,7 @@ import (
 	apievents "github.com/gravitational/teleport/api/types/events"
 	"github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/services"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 const (
@@ -75,6 +79,10 @@ type Exec interface {
 	// Wait will block while the command executes.
 	Wait() *ExecResult
 
+	// WaitForChild blocks until the child process has completed any required
+	// setup operations before proceeding with execution.
+	WaitForChild() error
+
 	// Continue will resume execution of the process after it completes its
 	// pre-processing routine (placed in a cgroup).
 	Continue()
@@ -97,7 +105,7 @@ func NewExecRequest(ctx *ServerContext, command string) (Exec, error) {
 	// If this is a registered OpenSSH node or proxy recoding mode is
 	// enabled, execute the command on a remote host. This is used by
 	// in-memory forwarding nodes.
-	if ctx.ServerSubKind == types.SubKindOpenSSHNode || services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) {
+	if types.IsOpenSSHNodeSubKind(ctx.ServerSubKind) || services.IsRecordAtProxy(ctx.SessionRecordingConfig.GetMode()) {
 		return &remoteExec{
 			ctx:     ctx,
 			command: command,
@@ -153,7 +161,13 @@ func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult
 
 	// Connect stdout and stderr to the channel so the user can interact with the command.
 	e.Cmd.Stderr = channel.Stderr()
-	e.Cmd.Stdout = channel
+
+	if e.Ctx.recordNonInteractiveSession {
+		e.Ctx.Tracef("Starting local exec and recording non-interactive session")
+		e.Cmd.Stdout = io.MultiWriter(e.Ctx.multiWriter, channel)
+	} else {
+		e.Cmd.Stdout = channel
+	}
 
 	// Copy from the channel (client input) into stdin of the process.
 	inputWriter, err := e.Cmd.StdinPipe()
@@ -174,6 +188,12 @@ func (e *localExec) Start(ctx context.Context, channel ssh.Channel) (*ExecResult
 			Code:    exitCode(err),
 		}, trace.ConvertSystemError(err)
 	}
+	// Close our half of the write pipe since it is only to be used by the child process.
+	// Not closing prevents being signaled when the child closes its half.
+	if err := e.Ctx.readyw.Close(); err != nil {
+		e.Ctx.Logger.WithError(err).Warn("Failed to close parent process ready signal write fd")
+	}
+	e.Ctx.readyw = nil
 
 	go func() {
 		if _, err := io.Copy(inputWriter, channel); err != nil {
@@ -212,6 +232,14 @@ func (e *localExec) Wait() *ExecResult {
 	return execResult
 }
 
+func (e *localExec) WaitForChild() error {
+	err := waitForSignal(e.Ctx.readyr, 20*time.Second)
+	closeErr := e.Ctx.readyr.Close()
+	// Set to nil so the close in the context doesn't attempt to re-close.
+	e.Ctx.readyr = nil
+	return trace.NewAggregate(err, closeErr)
+}
+
 // Continue will resume execution of the process after it completes its
 // pre-processing routine (placed in a cgroup).
 func (e *localExec) Continue() {
@@ -233,6 +261,16 @@ func (e *localExec) String() string {
 func (e *localExec) transformSecureCopy() error {
 	isSCPCmd, err := checkSCPAllowed(e.Ctx, e.GetCommand())
 	if err != nil {
+		e.Ctx.GetServer().EmitAuditEvent(context.WithoutCancel(e.Ctx.Context), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SCPDisallowedCode,
+				Type: events.SCPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.Ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.Ctx.GetServerMetadata(),
+			Error:          err.Error(),
+		})
 		return trace.Wrap(err)
 	}
 	if !isSCPCmd {
@@ -277,28 +315,26 @@ func checkSCPAllowed(scx *ServerContext, command string) (bool, error) {
 	return true, trace.Wrap(scx.CheckFileCopyingAllowed())
 }
 
-// waitForContinue will wait 10 seconds for the continue signal, if not
+// waitForSignal will wait 10 seconds for the other side of the pipe to signal, if not
 // received, it will stop waiting and exit.
-func waitForContinue(contfd *os.File) error {
+func waitForSignal(fd *os.File, timeout time.Duration) error {
 	waitCh := make(chan error, 1)
 	go func() {
-		// Reading from the continue file descriptor will block until it's closed. It
-		// won't be closed until the parent has placed it in a cgroup.
-		buf := make([]byte, 1)
-		_, err := contfd.Read(buf)
-		if err == io.EOF {
+		// Reading from the file descriptor will block until it's closed.
+		_, err := fd.Read(make([]byte, 1))
+		if errors.Is(err, io.EOF) {
 			err = nil
 		}
 		waitCh <- err
 	}()
 
-	// Wait for 10 seconds and then timeout if no continue signal has been sent.
-	timeout := time.NewTimer(10 * time.Second)
-	defer timeout.Stop()
+	// Timeout if no signal has been sent within the provided duration.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	select {
-	case <-timeout.C:
-		return trace.BadParameter("timed out waiting for continue signal")
+	case <-timer.C:
+		return trace.LimitExceeded("timed out waiting for continue signal")
 	case err := <-waitCh:
 		return err
 	}
@@ -330,11 +366,27 @@ func (e *remoteExec) SetCommand(command string) {
 // ExecResult is only used to communicate an error while launching.
 func (e *remoteExec) Start(ctx context.Context, ch ssh.Channel) (*ExecResult, error) {
 	if _, err := checkSCPAllowed(e.ctx, e.GetCommand()); err != nil {
+		e.ctx.GetServer().EmitAuditEvent(context.WithoutCancel(ctx), &apievents.SFTP{
+			Metadata: apievents.Metadata{
+				Code: events.SCPDisallowedCode,
+				Type: events.SCPEvent,
+				Time: time.Now(),
+			},
+			UserMetadata:   e.ctx.Identity.GetUserMetadata(),
+			ServerMetadata: e.ctx.GetServerMetadata(),
+			Error:          err.Error(),
+		})
 		return nil, trace.Wrap(err)
 	}
 
 	// hook up stdout/err the channel so the user can interact with the command
-	e.session.Stdout = ch
+	if e.ctx.recordNonInteractiveSession {
+		e.ctx.Tracef("Starting remote exec and recording non-interactive session")
+		e.session.Stdout = io.MultiWriter(e.ctx.multiWriter, ch)
+	} else {
+		e.session.Stdout = ch
+	}
+
 	e.session.Stderr = ch.Stderr()
 	inputWriter, err := e.session.StdinPipe()
 	if err != nil {
@@ -376,6 +428,8 @@ func (e *remoteExec) Wait() *ExecResult {
 	}
 }
 
+func (e *remoteExec) WaitForChild() error { return nil }
+
 // Continue does nothing for remote command execution.
 func (e *remoteExec) Continue() {}
 
@@ -391,17 +445,8 @@ func (e *remoteExec) PID() int {
 // instead of ctx.srv.
 func emitExecAuditEvent(ctx *ServerContext, cmd string, execErr error) {
 	// Create common fields for event.
-	serverMeta := apievents.ServerMetadata{
-		ServerID:        ctx.srv.HostUUID(),
-		ServerHostname:  ctx.srv.GetInfo().GetHostname(),
-		ServerNamespace: ctx.srv.GetNamespace(),
-	}
-
-	sessionMeta := apievents.SessionMetadata{
-		SessionID: string(ctx.SessionID()),
-		WithMFA:   ctx.Identity.Certificate.Extensions[teleport.CertExtensionMFAVerified],
-	}
-
+	serverMeta := ctx.GetServerMetadata()
+	sessionMeta := ctx.GetSessionMetadata()
 	userMeta := ctx.Identity.GetUserMetadata()
 
 	connectionMeta := apievents.ConnectionMetadata{
@@ -495,7 +540,7 @@ func getDefaultEnvPath(uid string, loginDefsPath string) string {
 	envRootPath := defaultEnvRootPath
 
 	// open file, if it doesn't exist return a default path and move on
-	f, err := os.Open(loginDefsPath)
+	f, err := utils.OpenFileAllowingUnsafeLinks(loginDefsPath)
 	if err != nil {
 		if uid == "0" {
 			log.Infof("Unable to open %q: %v: returning default su path: %q", loginDefsPath, err, defaultEnvRootPath)
@@ -586,17 +631,19 @@ func exitCode(err error) int {
 		return teleport.RemoteCommandSuccess
 	}
 
-	switch v := err.(type) {
+	var execExitErr *exec.ExitError
+	var sshExitErr *ssh.ExitError
+	switch {
 	// Local execution.
-	case *exec.ExitError:
-		waitStatus, ok := v.Sys().(syscall.WaitStatus)
+	case errors.As(err, &execExitErr):
+		waitStatus, ok := execExitErr.Sys().(syscall.WaitStatus)
 		if !ok {
 			return teleport.RemoteCommandFailure
 		}
 		return waitStatus.ExitStatus()
 	// Remote execution.
-	case *ssh.ExitError:
-		return v.ExitStatus()
+	case errors.As(err, &sshExitErr):
+		return sshExitErr.ExitStatus()
 	// An error occurred, but the type is unknown, return a generic 255 code.
 	default:
 		log.Debugf("Unknown error returned when executing command: %T: %v.", err, err)
