@@ -51,11 +51,11 @@ import (
 // b) --session-id is the ID of a session - tsh operates on the
 // session recording by connecting to the Teleport cluster
 func onPlay(cf *CLIConf) error {
-	if format := strings.ToLower(cf.Format); format == teleport.PTY {
+	format := strings.ToLower(cf.Format)
+	if format == teleport.PTY {
 		return playSession(cf)
-	}
-	if cf.PlaySpeed != "1x" {
-		log.Warn("--speed is not applicable for formats other than pty")
+	} else if format == "json_extended" {
+		return playSessionExtended(cf)
 	}
 	return exportSession(cf)
 }
@@ -90,6 +90,34 @@ func playSession(cf *CLIConf) error {
 	}
 
 	if err := tc.Play(cf.Context, cf.SessionID, speed); err != nil {
+		if trace.IsNotFound(err) {
+			log.WithError(err).Debug("error playing session")
+			return trace.NotFound("Recording for session %s not found.", cf.SessionID)
+		}
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func playSessionExtended(cf *CLIConf) error {
+	isLocalFile := path.Ext(cf.SessionID) == ".tar"
+	if isLocalFile {
+		sid := sessionIDFromPath(cf.SessionID)
+		tarFile, err := os.Open(cf.SessionID)
+		if err != nil {
+			return trace.ConvertSystemError(err)
+		}
+		defer tarFile.Close()
+		if err := client.PlayFileExtended(cf.Context, tarFile, sid); err != nil {
+			return trace.Wrap(err)
+		}
+		return nil
+	}
+	tc, err := makeClient(cf, true)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if err := tc.Play(cf.Context, cf.Namespace, cf.SessionID); err != nil {
 		if trace.IsNotFound(err) {
 			log.WithError(err).Debug("error playing session")
 			return trace.NotFound("Recording for session %s not found.", cf.SessionID)

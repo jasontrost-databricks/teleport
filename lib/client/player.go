@@ -66,6 +66,7 @@ func (p *playFromFileStreamer) StreamSessionEvents(
 			}
 		}
 	}()
+
 	return evts, errs
 }
 
