@@ -827,7 +827,7 @@ func Run(ctx context.Context, args []string, opts ...cliOption) error {
 	play.Flag("cluster", clusterHelp).Short('c').StringVar(&cf.SiteName)
 	play.Flag("format", defaults.FormatFlagDescription(
 		teleport.PTY, teleport.JSON, teleport.YAML,
-	)).Short('f').Default(teleport.PTY).EnumVar(&cf.Format, teleport.PTY, teleport.JSON, teleport.YAML, "json_extended")
+	)).Short('f').Default(teleport.PTY).EnumVar(&cf.Format, teleport.PTY, teleport.JSON, teleport.YAML, teleport.JSON_EXTENDED)
 	play.Arg("session-id", "ID of the session to play").Required().StringVar(&cf.SessionID)
 
 	// scp
@@ -1518,7 +1518,7 @@ func onPlay(cf *CLIConf) error {
 	format := strings.ToLower(cf.Format)
 	if format == teleport.PTY {
 		return playSession(cf)
-	} else if format == "json_extended" {
+	} else if format == teleport.JSON_EXTENDED {
 		return playSessionExtended(cf)
 	}
 	return exportSession(cf)

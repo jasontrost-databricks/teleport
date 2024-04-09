@@ -300,6 +300,9 @@ const (
 	// JSON means JSON serialization format
 	JSON = "json"
 
+	// JSON_EXTENDED means JSON serialization format for full session logs including commands
+	JSON_EXTENDED = "json_extended"
+
 	// YAML means YAML serialization format
 	YAML = "yaml"
 
