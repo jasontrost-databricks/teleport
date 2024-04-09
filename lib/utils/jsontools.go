@@ -78,7 +78,7 @@ func FastUnmarshal(data []byte, v interface{}) error {
 var SafeConfig = jsoniter.Config{
 	EscapeHTML:                    false,
 	MarshalFloatWith6Digits:       true, // will lose precision
-	ObjectFieldMustBeSimpleString: true, // do not unescape object field
+	ObjectFieldMustBeSimpleString: false, // do not unescape object field
 	SortMapKeys:                   true,
 }.Froze()
 
@@ -88,7 +88,7 @@ var SafeConfigWithIndent = jsoniter.Config{
 	IndentionStep:                 2,
 	EscapeHTML:                    false,
 	MarshalFloatWith6Digits:       true, // will lose precision
-	ObjectFieldMustBeSimpleString: true, // do not unescape object field
+	ObjectFieldMustBeSimpleString: false, // do not unescape object field
 	SortMapKeys:                   true,
 }.Froze()
 

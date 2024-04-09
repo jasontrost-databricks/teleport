@@ -315,6 +315,9 @@ const (
 	// JSON means JSON serialization format
 	JSON = "json"
 
+	// JSON means JSON serialization format
+	JSON_EXTENDED = "json_extended"
+
 	// YAML means YAML serialization format
 	YAML = "yaml"
 

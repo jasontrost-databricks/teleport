@@ -22,6 +22,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -2211,9 +2212,68 @@ func playSession(ctx context.Context, sessionID string, speed float64, streamer 
 	return nil
 }
 
-func playSessionExtended(sessionEvents []events.EventFields, stream []byte) error {
-	player := newSessionPlayer(sessionEvents, stream, nil)
-	player.playRangeExtended(0,0)
+type extendedRecord struct {
+	Event string `json:"event"`
+	Session []string `json:"session"`
+}
+
+func playSessionExtended(ctx context.Context, sessionID string, streamer player.Streamer) error {
+	sid, err := session.ParseID(sessionID)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	player, err := player.New(&player.Config{
+		SessionID: *sid,
+		Streamer:  streamer,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	if err := player.Play(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	var builder strings.Builder
+	for evt := range player.C() {
+		switch evt := evt.(type) {
+			
+		// case *apievents.SessionStart:
+		// 	fmt.Printf("SessionStart\n")
+		// 	continue
+		// case *apievents.SessionEnd:
+		// 	fmt.Printf("SessionEnd\n")
+		// 	continue
+		// case *apievents.SessionLeave:
+		// 	fmt.Printf("SessionLeave\n")
+		// 	continue
+		// case *apievents.SessionPrint:
+		// 	fmt.Printf("SessionPrint\n")
+		// 	builder.WriteString(string(evt.Data))
+		// 	continue
+		default:
+			jsonData, err := json.Marshal(evt)
+			if err != nil {
+				fmt.Println("Error encoding JSON:", err)
+			}
+			fmt.Println(string(jsonData))
+			continue
+		}
+	}
+
+	session := builder.String()
+	sessionList := strings.Split(session, "\r\n")
+	extRec := extendedRecord{
+		Event: "print",
+		Session: sessionList,
+	}
+
+	jsonData, err := json.Marshal(extRec)
+	if err != nil {
+		fmt.Println("Error encoding JSON:", err)
+	}
+	fmt.Println(string(jsonData))
+
 	return nil
 }
 
@@ -2235,29 +2295,9 @@ func PlayFile(ctx context.Context, filename, sid string, speed float64) error {
 
 
 // PlayFile plays the recorded session from a tar file
-func PlayFileExtended(ctx context.Context, tarFile io.Reader, sid string) error {
-	var sessionEvents []events.EventFields
-	var stream []byte
-	protoReader := events.NewProtoReader(tarFile)
-	playbackDir, err := os.MkdirTemp("", "playback")
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	defer os.RemoveAll(playbackDir)
-	w, err := events.WriteForSSHPlayback(ctx, session.ID(sid), protoReader, playbackDir)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	sessionEvents, err = w.SessionEvents()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	stream, err = w.SessionChunks()
-	if err != nil {
-		return trace.Wrap(err)
-	}
-
-	return playSessionExtended(sessionEvents, stream)
+func PlayFileExtended(ctx context.Context, filename, sid string) error {
+	streamer := &playFromFileStreamer{filename: filename}
+	return playSessionExtended(ctx, sid, streamer)
 }
 
 // SFTP securely copies files between Nodes or SSH servers using SFTP

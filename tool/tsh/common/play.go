@@ -58,7 +58,7 @@ func onPlay(cf *CLIConf) error {
 	if cf.PlaySpeed != "1x" {
 		log.Warn("--speed is not applicable for formats other than pty")
 	}
-	if format == "json_extended" {
+	if format == teleport.JSON_EXTENDED {
 		return playSessionExtended(cf)
 	}
 	return exportSession(cf)
@@ -107,28 +107,12 @@ func playSessionExtended(cf *CLIConf) error {
 	isLocalFile := path.Ext(cf.SessionID) == ".tar"
 	if isLocalFile {
 		sid := sessionIDFromPath(cf.SessionID)
-		tarFile, err := os.Open(cf.SessionID)
-		if err != nil {
-			return trace.ConvertSystemError(err)
-		}
-		defer tarFile.Close()
-		if err := client.PlayFileExtended(cf.Context, tarFile, sid); err != nil {
+		if err := client.PlayFileExtended(cf.Context, cf.SessionID, sid); err != nil {
 			return trace.Wrap(err)
 		}
 		return nil
 	}
-	tc, err := makeClient(cf, true)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	if err := tc.Play(cf.Context, cf.Namespace, cf.SessionID); err != nil {
-		if trace.IsNotFound(err) {
-			log.WithError(err).Debug("error playing session")
-			return trace.NotFound("Recording for session %s not found.", cf.SessionID)
-		}
-		return trace.Wrap(err)
-	}
-	return nil
+	return trace.Errorf("Extended Session playback only supported on local files")
 }
 
 func sessionIDFromPath(path string) string {

@@ -21,7 +21,6 @@ package client
 import (
 	"context"
 	"os"
-	"encoding/json"
 
 	"github.com/gravitational/trace"
 
@@ -67,53 +66,4 @@ func (p *playFromFileStreamer) StreamSessionEvents(
 	}()
 
 	return evts, errs
-}
-
-type extendedRecord struct {
-	Event string `json:"event"`
-	Session []string `json:"session"`
-}
-
-func (p *sessionPlayer) playRangeExtended(from, to int) {
-	if to == 0 {
-		to = len(p.sessionEvents)
-	}
-	var i int
-	var builder strings.Builder
-	offset, bytes := 0, 0
-	for i = 0; i < to; i++ {
-		
-		e := p.sessionEvents[i]
-		eventType := e.GetString(events.EventType)
-
-		switch eventType {
-		// 'print' event (output)
-		case events.SessionPrintEvent:
-			offset = e.GetInt("offset")
-			bytes = e.GetInt("bytes")
-			data := p.stream[offset : offset+bytes]
-			builder.WriteString(string(data))
-
-		default:
-			jsonData, err := json.Marshal(e)
-			if err != nil {
-				fmt.Println("Error encoding JSON:", err)
-			}
-			fmt.Println(string(jsonData))
-			continue
-		}
-	}
-
-	session := builder.String()
-	sessionList := strings.Split(session, "\r\n")
-	extRec := extendedRecord{
-		Event: "print",
-		Session: sessionList,
-	}
-
-	jsonData, err := json.Marshal(extRec)
-	if err != nil {
-		fmt.Println("Error encoding JSON:", err)
-	}
-	fmt.Println(string(jsonData))
 }
