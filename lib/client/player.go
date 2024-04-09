@@ -22,7 +22,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"regexp"
 	"encoding/json"
 
 	"github.com/jonboulle/clockwork"
@@ -282,15 +281,29 @@ func (p *sessionPlayer) playRange(from, to int) {
 }
 
 type extendedRecord struct {
-	Event string `json:"event"`
-	Session []string `json:"session"`
-	SessionCleaned []string `json:"session_clean"`
+	SessionID string `json:"session_id"`
+	SessionOutput []string `json:"session_output"`
+	AccessRequests []string `json:"access_requests"`
+	RemoteAddr string `json:"addr_remote"`
+	ClusterName string `json:"cluster_name"`
+	InitialCommand []string `json:"initial_command"`
+	Login string `json:"login"`
+	Namespace string `json:"namespace"`
+	Proto string  `json:"proto"`
+	ServerHostname string `json:"server_hostname"`
+	ServerID string `json:"server_id"`
+	SessionRecording string `json:"session_recording"`
+	Time string `json:"time"`
+	User string `json:"user"`
 }
 
 func (p *sessionPlayer) playRangeExtended(from, to int) {
 	if to == 0 {
 		to = len(p.sessionEvents)
 	}
+
+	extRec := extendedRecord{}
+
 	var i int
 	var builder strings.Builder
 	offset, bytes := 0, 0
@@ -300,34 +313,32 @@ func (p *sessionPlayer) playRangeExtended(from, to int) {
 		eventType := e.GetString(events.EventType)
 
 		switch eventType {
-		// 'print' event (output)
+		case events.SessionStartEvent:
+			extRec.SessionID = e.GetString("sid")
+			extRec.AccessRequests = e.GetStrings("access_requests")
+			extRec.RemoteAddr = e.GetString("addr.remote")
+			extRec.ClusterName = e.GetString("cluster_name")
+			extRec.InitialCommand = e.GetStrings("initial_command")
+			extRec.Login = e.GetString("login")
+			extRec.Namespace = e.GetString("namespace")
+			extRec.Proto = e.GetString("proto")
+			extRec.ServerHostname = e.GetString("server_hostname")
+			extRec.ServerID = e.GetString("server_id")
+			extRec.SessionRecording = e.GetString("session_recording")
+			extRec.Time = e.GetString("time")
+			extRec.User = e.GetString("user")
 		case events.SessionPrintEvent:
 			offset = e.GetInt("offset")
 			bytes = e.GetInt("bytes")
 			data := p.stream[offset : offset+bytes]
 			builder.WriteString(string(data))
-
 		default:
-			jsonData, err := json.Marshal(e)
-			if err != nil {
-				fmt.Println("Error encoding JSON:", err)
-			}
-			fmt.Println(string(jsonData))
 			continue
 		}
 	}
 
 	session := builder.String()
-	ansiRegex := regexp.MustCompile("\x1b\\[(?:[0-9]{1,2}(?:;[0-9]{1,2})*)?[m|K]")
-	sessionCleaned := ansiRegex.ReplaceAllString(session, "")
-
-	sessionList := strings.Split(session, "\r\n")
-	sessionListCleaned := strings.Split(sessionCleaned, "\r\n")
-	extRec := extendedRecord{
-		Event: "print",
-		Session: sessionList,
-		SessionCleaned: sessionListCleaned,
-	}
+	extRec.SessionOutput = strings.Split(session, "\r\n")
 
 	jsonData, err := json.Marshal(extRec)
 	if err != nil {
